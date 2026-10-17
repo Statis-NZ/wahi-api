@@ -1,0 +1,6 @@
+road_section_id,road_id,full_road_name,road_name_label,road_name_body,road_name_type,road_name_suffix,secondary_road_name,tertiary_road_name,suburb_locality,town_city,territorial_authority,is_land,shape
+2000001,1000000,Queen Street West,Queen St W,Queen,Street,West,,,Auckland Central,Auckland,Auckland,true,"LINESTRING (174.7630 -36.8480, 174.7633 -36.8485, 174.7636 -36.8490)"
+2000002,1000000,Queen Street West,Queen St W,Queen,Street,West,,,Auckland Central,Auckland,Auckland,true,"LINESTRING (174.7636 -36.8490, 174.7640 -36.8500)"
+2000003,1000001,Ponsonby Road,Ponsonby Rd,Ponsonby,Road,,,,Ponsonby,Auckland,Auckland,true,"LINESTRING (174.7450 -36.8550, 174.7460 -36.8520, 174.7470 -36.8490)"
+2000004,1000002,Main South Road,Main South Rd,Main South,Road,,State Highway 45,Surf Highway,Oakura,New Plymouth,New Plymouth District,true,"LINESTRING (173.9510 -39.1160, 173.9550 -39.1170, 173.9590 -39.1180)"
+2000005,1000003,Lambton Quay,Lambton Qy,Lambton,Quay,,,,Wellington Central,Wellington,Wellington City,true,"LINESTRING (174.7760 -41.2810, 174.7762 -41.2790, 174.7765 -41.2770)"
