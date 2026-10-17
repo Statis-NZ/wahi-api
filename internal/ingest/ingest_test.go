@@ -217,3 +217,12 @@ func TestRunPipelineWithMockMeilisearch(t *testing.T) {
 		t.Fatalf("RunPipeline failed: %v", err)
 	}
 }
+
+func TestDownloaderWFSURL(t *testing.T) {
+	dl := NewDownloader("https://data.linz.govt.nz", "dummy_key")
+	u := dl.buildWFSURL("data.linz.govt.nz:layer-113764", nil)
+	if !strings.Contains(u, "typeNames=data.linz.govt.nz%3Alayer-113764") {
+		t.Errorf("expected data.linz.govt.nz:layer-113764 in WFS URL, got %s", u)
+	}
+}
+

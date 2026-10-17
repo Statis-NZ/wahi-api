@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bufio"
 	"os"
 	"strconv"
 	"strings"
@@ -24,8 +25,10 @@ type Config struct {
 	AddressesCSVPath string
 }
 
-// Load reads configuration from environment variables with sensible defaults.
+// Load reads configuration from environment variables (and .env if present) with sensible defaults.
 func Load() *Config {
+	loadDotEnv(".env")
+
 	meiliKey := getEnv("MEILI_API_KEY", "")
 	if meiliKey == "" {
 		meiliKey = getEnv("MEILI_MASTER_KEY", "change_me_in_production_min_16_bytes")
@@ -85,3 +88,31 @@ func getEnvFloat(key string, fallback float64) float64 {
 	}
 	return val
 }
+
+func loadDotEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		idx := strings.IndexByte(line, '=')
+		if idx <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		val := strings.TrimSpace(line[idx+1:])
+		val = strings.Trim(val, `"'`)
+		if _, exists := os.LookupEnv(key); !exists {
+			_ = os.Setenv(key, val)
+		}
+	}
+}
+

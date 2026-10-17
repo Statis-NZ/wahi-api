@@ -34,7 +34,7 @@ func NewDownloader(baseURL, apiKey string) *Downloader {
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  strings.TrimSpace(apiKey),
 		HTTPClient: &http.Client{
-			Timeout: 30 * time.Minute,
+			Timeout: 2 * time.Hour,
 		},
 	}
 }
@@ -54,7 +54,7 @@ func (d *Downloader) OpenLayerCSV(ctx context.Context, layerID int, localPath st
 		return nil, fmt.Errorf("LINZ_API_KEY is required when no local CSV path is provided for layer %d", layerID)
 	}
 
-	reqURL := d.buildWFSURL(fmt.Sprintf("layer-%d", layerID), nil)
+	reqURL := d.buildWFSURL(fmt.Sprintf("data.linz.govt.nz:layer-%d", layerID), nil)
 	return d.streamURL(ctx, reqURL)
 }
 
@@ -65,7 +65,7 @@ func (d *Downloader) OpenChangesetCSV(ctx context.Context, layerID int, fromTime
 	}
 	extra := url.Values{}
 	extra.Set("viewparams", fmt.Sprintf("from:%s;to:%s", fromTime, toTime))
-	reqURL := d.buildWFSURL(fmt.Sprintf("layer-%d-changeset", layerID), extra)
+	reqURL := d.buildWFSURL(fmt.Sprintf("data.linz.govt.nz:layer-%d-changeset", layerID), extra)
 	return d.streamURL(ctx, reqURL)
 }
 
