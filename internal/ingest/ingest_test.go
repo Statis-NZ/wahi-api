@@ -12,7 +12,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/meilisearch/meilisearch-go"
+	meilisearch "github.com/meilisearch/meilisearch-go"
 	"github.com/statis/wahi-api/internal/config"
 	"github.com/statis/wahi-api/internal/models"
 )
@@ -63,7 +63,7 @@ func TestETLJoinAndStreamFixtures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open suburbs.csv: %v", err)
 	}
-	defer suburbsFile.Close()
+	defer func() { _ = suburbsFile.Close() }()
 
 	localities, suburbMap, err := LoadSuburbsCSV(suburbsFile)
 	if err != nil {
@@ -84,7 +84,7 @@ func TestETLJoinAndStreamFixtures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open roads.csv: %v", err)
 	}
-	defer roadsFile.Close()
+	defer func() { _ = roadsFile.Close() }()
 
 	streets, roadMap, err := LoadRoadSectionsCSV(roadsFile, suburbMap)
 	if err != nil {
@@ -106,7 +106,7 @@ func TestETLJoinAndStreamFixtures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open addresses.csv: %v", err)
 	}
-	defer addrFile.Close()
+	defer func() { _ = addrFile.Close() }()
 
 	var allAddresses []models.AddressDocument
 	batches := 0
@@ -244,7 +244,7 @@ func TestLiveSuburbsMemory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenLayerCSV: %v", err)
 	}
-	defer rc.Close()
+	defer func() { _ = rc.Close() }()
 
 	docs, suburbMap, err := LoadSuburbsCSV(rc)
 	if err != nil {
@@ -255,5 +255,3 @@ func TestLiveSuburbsMemory(t *testing.T) {
 	t.Logf("Loaded %d localities, %d suburb keys | HeapAlloc=%d MiB, HeapInuse=%d MiB, Sys=%d MiB",
 		len(docs), len(suburbMap), ms.HeapAlloc/1024/1024, ms.HeapInuse/1024/1024, ms.Sys/1024/1024)
 }
-
-

@@ -10,7 +10,7 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/meilisearch/meilisearch-go"
+	meilisearch "github.com/meilisearch/meilisearch-go"
 	"github.com/statis/wahi-api/internal/config"
 	"github.com/statis/wahi-api/internal/models"
 )
@@ -304,7 +304,6 @@ func (idx *Indexer) RunPipeline(ctx context.Context, cfg *config.Config, dl *Dow
 	if err := idx.IndexLocalities(ctx, localityDocs); err != nil {
 		return err
 	}
-	localityDocs = nil
 	runtime.GC()
 
 	// Step 3.2: Stream NZ Addresses: Road Sections (Layer 123109)
@@ -332,7 +331,7 @@ func (idx *Indexer) RunPipeline(ctx context.Context, cfg *config.Config, dl *Dow
 	if err != nil {
 		return err
 	}
-	defer addrRC.Close()
+	defer func() { _ = addrRC.Close() }()
 
 	batchNum := 0
 	totalAddresses, err := StreamAddressesCSV(addrRC, suburbMap, roadMap, idx.BatchSize, func(batch []models.AddressDocument) error {
@@ -344,9 +343,6 @@ func (idx *Indexer) RunPipeline(ctx context.Context, cfg *config.Config, dl *Dow
 		return err
 	}
 
-	// Free in-memory lookup maps once ingestion finishes
-	suburbMap = nil
-	roadMap = nil
 	runtime.GC()
 	debug.FreeOSMemory()
 
