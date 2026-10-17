@@ -217,3 +217,12 @@ Run the full unit and integration test suite:
 ```bash
 go test -v ./...
 ```
+
+---
+
+## License
+
+This project is licensed under the [MIT License](file:///Users/cameron/Sites/statis/wahi-api/LICENSE.md) © 2026 Cameron Prebble.
+
+Contains data sourced from the [Toitū Te Whenua Land Information New Zealand (LINZ) Data Service](https://data.linz.govt.nz) licensed under [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
