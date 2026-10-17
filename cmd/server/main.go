@@ -70,11 +70,31 @@ func runServe(cfg *config.Config, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	sighupCh := make(chan os.Signal, 1)
+	signal.Notify(sighupCh, syscall.SIGHUP)
+	defer signal.Stop(sighupCh)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sighupCh:
+				tokens := config.ReloadAccessTokens(".env")
+				srv.UpdateAccessTokens(tokens)
+				slog.Info("reloaded API access tokens on SIGHUP", "active_tokens", len(tokens))
+			}
+		}
+	}()
+
 	errCh := make(chan error, 1)
 	go func() {
 		slog.Info("starting Wāhi API server",
 			"addr", httpServer.Addr,
 			"meili_host", cfg.MeiliHost,
+			"cors_origins", cfg.CORSOrigins,
+			"cors_strict", cfg.CORSStrict,
+			"auth_enabled", len(cfg.APIAccessTokens) > 0,
+			"active_tokens", len(cfg.APIAccessTokens),
 			"docs_url", fmt.Sprintf("http://localhost:%s/docs", cfg.Port),
 		)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {

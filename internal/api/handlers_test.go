@@ -338,3 +338,99 @@ func TestRateLimitingAndCORS(t *testing.T) {
 		t.Fatalf("expected second request 429 Too Many Requests, got %d", rec2.Code)
 	}
 }
+
+func TestAccessTokenAuthAndRotation(t *testing.T) {
+	srv, _ := newTestServer(t, 50, 100)
+	srv.UpdateAccessTokens([]string{"token_v1"})
+
+	// 1. Missing token -> 401
+	reqMissing := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=Queen", nil)
+	recMissing := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(recMissing, reqMissing)
+	if recMissing.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got %d", recMissing.Code)
+	}
+
+	// 2. Invalid token -> 401
+	reqInvalid := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=Queen", nil)
+	reqInvalid.Header.Set("Authorization", "Bearer wrong_token")
+	recInvalid := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(recInvalid, reqInvalid)
+	if recInvalid.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with invalid token, got %d", recInvalid.Code)
+	}
+
+	// 3. Valid Bearer token -> 200
+	reqBearer := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=Queen", nil)
+	reqBearer.Header.Set("Authorization", "Bearer token_v1")
+	recBearer := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(recBearer, reqBearer)
+	if recBearer.Code != http.StatusOK {
+		t.Fatalf("expected 200 with valid Bearer token, got %d", recBearer.Code)
+	}
+
+	// 4. Rotate tokens: add token_v2 alongside token_v1
+	srv.UpdateAccessTokens([]string{"token_v2", "token_v1"})
+
+	// Both X-API-Key: token_v2 and ?api_key=token_v1 work during rotation window
+	reqHeaderKey := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=Queen", nil)
+	reqHeaderKey.Header.Set("X-API-Key", "token_v2")
+	recHeaderKey := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(recHeaderKey, reqHeaderKey)
+	if recHeaderKey.Code != http.StatusOK {
+		t.Fatalf("expected 200 with X-API-Key token_v2, got %d", recHeaderKey.Code)
+	}
+
+	reqQueryKey := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=Queen&api_key=token_v1", nil)
+	recQueryKey := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(recQueryKey, reqQueryKey)
+	if recQueryKey.Code != http.StatusOK {
+		t.Fatalf("expected 200 with ?api_key=token_v1 during rotation, got %d", recQueryKey.Code)
+	}
+
+	// 5. Complete rotation: retire token_v1
+	srv.UpdateAccessTokens([]string{"token_v2"})
+	recRetired := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(recRetired, reqQueryKey)
+	if recRetired.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for retired token_v1, got %d", recRetired.Code)
+	}
+
+	// 6. Healthz remains accessible without token
+	reqHealth := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	recHealth := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(recHealth, reqHealth)
+	if recHealth.Code != http.StatusOK {
+		t.Fatalf("expected /healthz 200 without token, got %d", recHealth.Code)
+	}
+}
+
+func TestCORSStrictAndWildcardSubdomains(t *testing.T) {
+	srv, _ := newTestServer(t, 50, 100)
+	srv.Config.CORSOrigins = []string{"https://example.com", "https://*.example.co.nz"}
+	srv.Config.CORSStrict = true
+	// Rebuild handler with updated CORS config
+	srv = NewServer(srv.Config, srv.Meili)
+
+	// Allowed wildcard subdomain
+	reqAllowed := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=Queen", nil)
+	reqAllowed.Header.Set("Origin", "https://checkout.example.co.nz")
+	recAllowed := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(recAllowed, reqAllowed)
+	if recAllowed.Code != http.StatusOK {
+		t.Fatalf("expected 200 for allowed wildcard subdomain, got %d", recAllowed.Code)
+	}
+	if got := recAllowed.Header().Get("Access-Control-Allow-Origin"); got != "https://checkout.example.co.nz" {
+		t.Errorf("expected Access-Control-Allow-Origin 'https://checkout.example.co.nz', got %q", got)
+	}
+
+	// Disallowed origin with CORS_STRICT=true -> 403 Forbidden
+	reqBlocked := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=Queen", nil)
+	reqBlocked.Header.Set("Origin", "https://evil.example.org")
+	recBlocked := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(recBlocked, reqBlocked)
+	if recBlocked.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 Forbidden for disallowed Origin under CORS_STRICT, got %d", recBlocked.Code)
+	}
+}
+

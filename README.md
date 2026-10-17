@@ -182,6 +182,34 @@ curl "http://localhost:8080/healthz"
 
 ---
 
+## Access Control (CORS & Rotatable Access Tokens)
+
+Deployers can configure who can access the service using environment variables in `.env`:
+
+### 1. Frontend CORS Configuration (`CORS_ORIGINS` & `CORS_STRICT`)
+
+- `CORS_ORIGINS`: Comma-separated list of allowed origins. Supports `*` (default), exact origins (`https://example.co.nz`), and wildcard subdomains (`https://*.example.co.nz`).
+- `CORS_STRICT`: Set to `true` to actively reject requests carrying a non-matching `Origin` header with `403 Forbidden`.
+
+```env
+CORS_ORIGINS=https://example.co.nz,https://*.example.co.nz
+CORS_STRICT=true
+```
+
+### 2. Rotatable Access Tokens (`API_ACCESS_TOKENS`)
+
+- `API_ACCESS_TOKENS` (or `API_ACCESS_TOKEN`): Comma-separated list of valid access tokens. When empty (default), endpoints are publicly accessible.
+- When set, requests to `/v1/*` must present a valid token via any of:
+  - `Authorization: Bearer <token>` header
+  - `X-API-Key: <token>` header
+  - `?api_key=<token>` query parameter
+- **Zero-Downtime Token Rotation:**
+  1. Add the new token alongside the existing token: `API_ACCESS_TOKENS=tok_new_v2,tok_old_v1`
+  2. Reload in-place by sending `SIGHUP` (`kill -HUP <pid>` or `docker kill -s HUP wahi-api`) or restarting the container.
+  3. Update client applications to use `tok_new_v2`, then remove `tok_old_v1` (`API_ACCESS_TOKENS=tok_new_v2`).
+
+---
+
 ## Testing
 
 Run the full unit and integration test suite:

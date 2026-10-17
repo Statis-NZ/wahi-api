@@ -9,15 +9,17 @@ import (
 
 // Config holds application configuration loaded from environment variables.
 type Config struct {
-	Port           string
-	MeiliHost      string
-	MeiliAPIKey    string
-	LINZAPIKey     string
-	LINZBaseURL    string
-	BatchSize      int
-	RateLimitRPS   float64
-	RateLimitBurst int
-	CORSOrigins    []string
+	Port            string
+	MeiliHost       string
+	MeiliAPIKey     string
+	LINZAPIKey      string
+	LINZBaseURL     string
+	BatchSize       int
+	RateLimitRPS    float64
+	RateLimitBurst  int
+	CORSOrigins     []string
+	CORSStrict      bool
+	APIAccessTokens []string
 
 	// Optional local CSV overrides for offline/fixture ingestion
 	SuburbsCSVPath   string
@@ -42,6 +44,11 @@ func Load() *Config {
 		}
 	}
 
+	accessTokens := parseAccessTokens(
+		getEnv("API_ACCESS_TOKENS", ""),
+		getEnv("API_ACCESS_TOKEN", ""),
+	)
+
 	return &Config{
 		Port:             getEnv("PORT", "8080"),
 		MeiliHost:        getEnv("MEILI_HOST", "http://localhost:7700"),
@@ -52,10 +59,42 @@ func Load() *Config {
 		RateLimitRPS:     getEnvFloat("RATE_LIMIT_RPS", 50.0),
 		RateLimitBurst:   getEnvInt("RATE_LIMIT_BURST", 100),
 		CORSOrigins:      corsOrigins,
+		CORSStrict:       getEnvBool("CORS_STRICT", false),
+		APIAccessTokens:  accessTokens,
 		SuburbsCSVPath:   getEnv("SUBURBS_CSV_PATH", ""),
 		RoadsCSVPath:     getEnv("ROADS_CSV_PATH", ""),
 		AddressesCSVPath: getEnv("ADDRESSES_CSV_PATH", ""),
 	}
+}
+
+// ReloadAccessTokens re-reads .env (overwriting API_ACCESS_TOKENS / API_ACCESS_TOKEN if present in .env)
+// and returns the updated list of valid access tokens for zero-downtime rotation.
+func ReloadAccessTokens(dotEnvPath string) []string {
+	if dotEnvPath != "" {
+		loadDotEnvOverwriteKeys(dotEnvPath, "API_ACCESS_TOKENS", "API_ACCESS_TOKEN")
+	}
+	return parseAccessTokens(
+		getEnv("API_ACCESS_TOKENS", ""),
+		getEnv("API_ACCESS_TOKEN", ""),
+	)
+}
+
+func parseAccessTokens(sources ...string) []string {
+	var tokens []string
+	seen := make(map[string]struct{})
+	for _, src := range sources {
+		for _, part := range strings.Split(src, ",") {
+			tok := strings.TrimSpace(part)
+			if tok == "" {
+				continue
+			}
+			if _, exists := seen[tok]; !exists {
+				seen[tok] = struct{}{}
+				tokens = append(tokens, tok)
+			}
+		}
+	}
+	return tokens
 }
 
 func getEnv(key, fallback string) string {
@@ -89,6 +128,18 @@ func getEnvFloat(key string, fallback float64) float64 {
 	return val
 }
 
+func getEnvBool(key string, fallback bool) bool {
+	valStr := strings.ToLower(getEnv(key, ""))
+	switch valStr {
+	case "true", "t", "1", "yes", "y":
+		return true
+	case "false", "f", "0", "no", "n":
+		return false
+	default:
+		return fallback
+	}
+}
+
 func loadDotEnv(path string) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -98,21 +149,52 @@ func loadDotEnv(path string) {
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		key, val, ok := parseEnvLine(scanner.Text())
+		if !ok {
 			continue
 		}
-		line = strings.TrimPrefix(line, "export ")
-		idx := strings.IndexByte(line, '=')
-		if idx <= 0 {
-			continue
-		}
-		key := strings.TrimSpace(line[:idx])
-		val := strings.TrimSpace(line[idx+1:])
-		val = strings.Trim(val, `"'`)
 		if _, exists := os.LookupEnv(key); !exists {
 			_ = os.Setenv(key, val)
 		}
 	}
 }
 
+func loadDotEnvOverwriteKeys(path string, targetKeys ...string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	targets := make(map[string]struct{}, len(targetKeys))
+	for _, k := range targetKeys {
+		targets[k] = struct{}{}
+	}
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		key, val, ok := parseEnvLine(scanner.Text())
+		if !ok {
+			continue
+		}
+		if _, match := targets[key]; match {
+			_ = os.Setenv(key, val)
+		}
+	}
+}
+
+func parseEnvLine(raw string) (string, string, bool) {
+	line := strings.TrimSpace(raw)
+	if line == "" || strings.HasPrefix(line, "#") {
+		return "", "", false
+	}
+	line = strings.TrimPrefix(line, "export ")
+	idx := strings.IndexByte(line, '=')
+	if idx <= 0 {
+		return "", "", false
+	}
+	key := strings.TrimSpace(line[:idx])
+	val := strings.TrimSpace(line[idx+1:])
+	val = strings.Trim(val, `"'`)
+	return key, val, true
+}

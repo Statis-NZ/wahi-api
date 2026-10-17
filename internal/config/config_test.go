@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -21,6 +22,12 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.MeiliAPIKey != "change_me_in_production_min_16_bytes" {
 		t.Errorf("unexpected default MeiliAPIKey: %s", cfg.MeiliAPIKey)
 	}
+	if cfg.CORSStrict {
+		t.Errorf("expected default CORSStrict false, got true")
+	}
+	if len(cfg.APIAccessTokens) != 0 {
+		t.Errorf("expected empty default APIAccessTokens, got %v", cfg.APIAccessTokens)
+	}
 }
 
 func TestLoadCustomEnv(t *testing.T) {
@@ -30,7 +37,10 @@ func TestLoadCustomEnv(t *testing.T) {
 	t.Setenv("MEILI_MASTER_KEY", "master_secret_key_123")
 	t.Setenv("LINZ_API_KEY", "linz_key_abc")
 	t.Setenv("INGEST_BATCH_SIZE", "10000")
-	t.Setenv("CORS_ORIGINS", "https://example.com, https://app.example.com")
+	t.Setenv("CORS_ORIGINS", "https://example.com, https://*.example.com")
+	t.Setenv("CORS_STRICT", "true")
+	t.Setenv("API_ACCESS_TOKENS", "tok_current_v2, tok_previous_v1")
+	t.Setenv("API_ACCESS_TOKEN", "tok_legacy_single")
 
 	cfg := Load()
 	if cfg.Port != "9090" {
@@ -50,5 +60,34 @@ func TestLoadCustomEnv(t *testing.T) {
 	}
 	if len(cfg.CORSOrigins) != 2 || cfg.CORSOrigins[0] != "https://example.com" {
 		t.Errorf("unexpected CORSOrigins: %v", cfg.CORSOrigins)
+	}
+	if !cfg.CORSStrict {
+		t.Errorf("expected CORSStrict true")
+	}
+	if len(cfg.APIAccessTokens) != 3 || cfg.APIAccessTokens[0] != "tok_current_v2" || cfg.APIAccessTokens[1] != "tok_previous_v1" || cfg.APIAccessTokens[2] != "tok_legacy_single" {
+		t.Errorf("unexpected APIAccessTokens: %v", cfg.APIAccessTokens)
+	}
+}
+
+func TestReloadAccessTokensFromDotEnv(t *testing.T) {
+	os.Clearenv()
+	tmpDir := t.TempDir()
+	envPath := filepath.Join(tmpDir, ".env")
+
+	if err := os.WriteFile(envPath, []byte("API_ACCESS_TOKENS=token_v1\n"), 0600); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	tokens := ReloadAccessTokens(envPath)
+	if len(tokens) != 1 || tokens[0] != "token_v1" {
+		t.Fatalf("expected [token_v1], got %v", tokens)
+	}
+
+	// Simulate rotating token in .env to include v2 and v1
+	if err := os.WriteFile(envPath, []byte("API_ACCESS_TOKENS=token_v2,token_v1\n"), 0600); err != nil {
+		t.Fatalf("write rotated .env: %v", err)
+	}
+	rotated := ReloadAccessTokens(envPath)
+	if len(rotated) != 2 || rotated[0] != "token_v2" || rotated[1] != "token_v1" {
+		t.Fatalf("expected [token_v2 token_v1], got %v", rotated)
 	}
 }

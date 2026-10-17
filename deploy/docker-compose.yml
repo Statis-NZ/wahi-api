@@ -29,6 +29,9 @@ services:
     environment:
       - PORT=8080
       - GOMEMLIMIT=200MiB
+      - CORS_ORIGINS=${CORS_ORIGINS:-*}
+      - CORS_STRICT=${CORS_STRICT:-false}
+      - API_ACCESS_TOKENS=${API_ACCESS_TOKENS:-}
       - MEILI_HOST=http://meilisearch:7700
       - MEILI_API_KEY=${MEILI_MASTER_KEY:-change_me_in_production_min_16_bytes}
       - LINZ_API_KEY=${LINZ_API_KEY}

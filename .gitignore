@@ -32,5 +32,5 @@ go.work
 .DS_Store
 
 # Data directory contents (keep the directory and .keep file)
-/data/*
-!/data/.keep
+data/*
+!data/.keep
