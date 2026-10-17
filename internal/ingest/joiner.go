@@ -3,6 +3,7 @@ package ingest
 import (
 	"encoding/csv"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"math"
 	"strconv"
@@ -15,7 +16,7 @@ import (
 
 // NormalizeSuburbKey normalizes a suburb/locality name for case-insensitive lookup.
 func NormalizeSuburbKey(name string) string {
-	return strings.ToLower(strings.TrimSpace(name))
+	return strings.Clone(strings.ToLower(strings.TrimSpace(name)))
 }
 
 // ParseWKTToGeo parses a WKT geometry string (Point, LineString, MultiLineString,
@@ -32,8 +33,30 @@ func ParseWKTToGeo(rawWKT string) (*models.MeiliGeo, error) {
 		trimmed = strings.TrimSpace(trimmed[idx+1:])
 	}
 
+	// Fast zero-allocation scanner for large geometries (> 4KB, such as complex coastline
+	// MULTIPOLYGONs in NZ Suburbs and Localities) to avoid large AST allocations in memory-constrained containers.
+	if len(trimmed) > 4096 {
+		x, y, ok := scanWKTBoundsCenter(trimmed)
+		if !ok {
+			return nil, fmt.Errorf("failed to scan coordinates from large WKT")
+		}
+		lat, lng := normalizeOrConvertCoords(x, y)
+		return &models.MeiliGeo{
+			Lat: math.Round(lat*1e6) / 1e6,
+			Lng: math.Round(lng*1e6) / 1e6,
+		}, nil
+	}
+
 	g, err := wkt.Unmarshal(trimmed)
 	if err != nil {
+		// Fallback to streaming coordinate scanner if WKT has minor dialect differences
+		if x, y, ok := scanWKTBoundsCenter(trimmed); ok {
+			lat, lng := normalizeOrConvertCoords(x, y)
+			return &models.MeiliGeo{
+				Lat: math.Round(lat*1e6) / 1e6,
+				Lng: math.Round(lng*1e6) / 1e6,
+			}, nil
+		}
 		return nil, fmt.Errorf("unmarshal WKT: %w", err)
 	}
 
@@ -85,13 +108,85 @@ func ParseWKTToGeo(rawWKT string) (*models.MeiliGeo, error) {
 	}, nil
 }
 
+// scanWKTBoundsCenter scans (x, y) coordinate pairs from a WKT string in a single pass
+// with zero heap allocations, returning the bounding box center.
+func scanWKTBoundsCenter(s string) (centerX, centerY float64, ok bool) {
+	idx := strings.IndexByte(s, '(')
+	if idx == -1 {
+		return 0, 0, false
+	}
+	n := len(s)
+	i := idx + 1
+
+	minX, maxX := math.MaxFloat64, -math.MaxFloat64
+	minY, maxY := math.MaxFloat64, -math.MaxFloat64
+	count := 0
+
+	for i < n {
+		// Advance to start of first number in coordinate tuple
+		for i < n && !isNumChar(s[i]) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		startX := i
+		for i < n && isNumChar(s[i]) {
+			i++
+		}
+		x, err1 := strconv.ParseFloat(s[startX:i], 64)
+
+		// Skip whitespace between X and Y
+		for i < n && (s[i] == ' ' || s[i] == '\t') {
+			i++
+		}
+		if i >= n || !isNumChar(s[i]) {
+			continue
+		}
+		startY := i
+		for i < n && isNumChar(s[i]) {
+			i++
+		}
+		y, err2 := strconv.ParseFloat(s[startY:i], 64)
+
+		// Skip any optional Z/M coordinates up to next delimiter (',' or ')')
+		for i < n && s[i] != ',' && s[i] != ')' && s[i] != '(' {
+			i++
+		}
+
+		if err1 == nil && err2 == nil {
+			if x < minX {
+				minX = x
+			}
+			if x > maxX {
+				maxX = x
+			}
+			if y < minY {
+				minY = y
+			}
+			if y > maxY {
+				maxY = y
+			}
+			count++
+		}
+	}
+
+	if count == 0 {
+		return 0, 0, false
+	}
+	return (minX + maxX) / 2.0, (minY + maxY) / 2.0, true
+}
+
+func isNumChar(b byte) bool {
+	return (b >= '0' && b <= '9') || b == '-' || b == '+' || b == '.' || b == 'e' || b == 'E'
+}
+
 func extractCentroidOrBoundsCenter(g geom.T) (float64, float64, error) {
 	flat := g.FlatCoords()
 	stride := g.Stride()
 	if len(flat) >= stride && stride >= 2 {
 		var sumX, sumY float64
 		count := len(flat) / stride
-		// Exclude closing duplicate vertex on simple rings when count > 1
 		if count > 1 && flat[0] == flat[(count-1)*stride] && flat[1] == flat[(count-1)*stride+1] {
 			count--
 		}
@@ -111,20 +206,14 @@ func extractCentroidOrBoundsCenter(g geom.T) (float64, float64, error) {
 // normalizeOrConvertCoords detects whether (x, y) is in NZTM2000 (EPSG:2193 meters)
 // or geographic degrees (EPSG:4167 / WGS84) and returns (lat, lng).
 func normalizeOrConvertCoords(x, y float64) (lat, lng float64) {
-	// Check if coordinates are in NZTM2000 meters (values > 100,000)
 	if math.Abs(x) > 100000 && math.Abs(y) > 100000 {
-		// In NZTM2000, Easting is ~1,000,000..2,600,000 and Northing is ~4,600,000..6,300,000
 		easting, northing := x, y
 		if x > 3500000 && y < 3500000 {
-			// Swapped (Northing, Easting) axis order
 			easting, northing = y, x
 		}
 		return nztm2000ToLatLon(easting, northing)
 	}
 
-	// Coordinates are in degrees (EPSG:4167 / EPSG:4326).
-	// Standard WKT is POINT(lon lat), where NZ lat is in [-60, -25] and lon is in [160, 180] or [-180, -170].
-	// However, some WFS exports emit (lat lon); detect by range.
 	if x >= -60 && x <= -25 && (y >= 160 || y <= -170) {
 		return x, y
 	}
@@ -136,12 +225,12 @@ func normalizeOrConvertCoords(x, y float64) (lat, lng float64) {
 // Reference: LINZ Standard for New Zealand Transverse Mercator 2000 (LINZS25002).
 func nztm2000ToLatLon(easting, northing float64) (latDeg, lonDeg float64) {
 	const (
-		a   = 6378137.0             // GRS80 semi-major axis
-		rf  = 298.257222101         // GRS80 inverse flattening
-		k0  = 0.9996                // Central meridian scale factor
-		fe  = 1600000.0             // False Easting (m)
-		fn  = 10000000.0            // False Northing (m)
-		cm0 = 173.0 * math.Pi / 180 // Central meridian (173° E in radians)
+		a   = 6378137.0
+		rf  = 298.257222101
+		k0  = 0.9996
+		fe  = 1600000.0
+		fn  = 10000000.0
+		cm0 = 173.0 * math.Pi / 180
 	)
 
 	f := 1.0 / rf
@@ -208,7 +297,7 @@ func LoadSuburbsCSV(r io.Reader) ([]models.LocalityDocument, map[string]models.S
 	}
 	colIdx := buildColumnMap(header)
 
-	var docs []models.LocalityDocument
+	docs := make([]models.LocalityDocument, 0, 3200)
 	lookup := make(map[string]models.SuburbMeta, 3200)
 
 	for {
@@ -220,21 +309,21 @@ func LoadSuburbsCSV(r io.Reader) ([]models.LocalityDocument, map[string]models.S
 			return nil, nil, fmt.Errorf("read suburbs CSV row: %w", err)
 		}
 
-		id, err := strconv.Atoi(getCol(rec, colIdx, "id"))
+		id, err := strconv.Atoi(getColRaw(rec, colIdx, "id"))
 		if err != nil {
 			continue
 		}
-		name := getCol(rec, colIdx, "name")
+		name := getColCloned(rec, colIdx, "name")
 		if name == "" {
 			continue
 		}
-		additionalName := getCol(rec, colIdx, "additional_name")
-		locType := getCol(rec, colIdx, "type")
-		majorName := getCol(rec, colIdx, "major_name")
-		majorNameType := getCol(rec, colIdx, "major_name_type")
-		ta := getCol(rec, colIdx, "territorial_authority")
-		pop, _ := strconv.Atoi(getCol(rec, colIdx, "population_estimate"))
-		shapeStr := getShapeCol(rec, colIdx)
+		additionalName := getColCloned(rec, colIdx, "additional_name")
+		locType := getColCloned(rec, colIdx, "type")
+		majorName := getColCloned(rec, colIdx, "major_name")
+		majorNameType := getColCloned(rec, colIdx, "major_name_type")
+		ta := getColCloned(rec, colIdx, "territorial_authority")
+		pop, _ := strconv.Atoi(getColRaw(rec, colIdx, "population_estimate"))
+		shapeStr := getShapeColRaw(rec, colIdx)
 
 		geo, _ := ParseWKTToGeo(shapeStr)
 
@@ -266,19 +355,43 @@ func LoadSuburbsCSV(r io.Reader) ([]models.LocalityDocument, map[string]models.S
 // aggregates unique streets by road_id + suburb_locality + town_city, enriches them
 // with suburb metadata, and returns deduplicated StreetDocuments plus a RoadAliases lookup map.
 func LoadRoadSectionsCSV(r io.Reader, suburbs map[string]models.SuburbMeta) ([]models.StreetDocument, map[int]models.RoadAliases, error) {
+	var allStreets []models.StreetDocument
+	roadAliases, err := StreamRoadSectionsCSV(r, suburbs, 10000, func(batch []models.StreetDocument) error {
+		allStreets = append(allStreets, batch...)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return allStreets, roadAliases, nil
+}
+
+// StreamRoadSectionsCSV streams the Road Sections CSV, emitting deduplicated StreetDocuments
+// in batches and returning a compact in-memory RoadAliases map keyed by road_id.
+func StreamRoadSectionsCSV(
+	r io.Reader,
+	suburbs map[string]models.SuburbMeta,
+	batchSize int,
+	onBatch func([]models.StreetDocument) error,
+) (map[int]models.RoadAliases, error) {
+	if batchSize <= 0 {
+		batchSize = 10000
+	}
+
 	cr := csv.NewReader(r)
 	cr.ReuseRecord = true
 	cr.LazyQuotes = true
 
 	header, err := cr.Read()
 	if err != nil {
-		return nil, nil, fmt.Errorf("read road sections CSV header: %w", err)
+		return nil, fmt.Errorf("read road sections CSV header: %w", err)
 	}
 	colIdx := buildColumnMap(header)
 
-	var streets []models.StreetDocument
-	seenStreets := make(map[string]struct{}, 64000)
+	batch := make([]models.StreetDocument, 0, batchSize)
+	seenStreets := make(map[uint64]struct{}, 64000)
 	roadAliases := make(map[int]models.RoadAliases, 64000)
+	seq := 0
 
 	for {
 		rec, err := cr.Read()
@@ -286,73 +399,109 @@ func LoadRoadSectionsCSV(r io.Reader, suburbs map[string]models.SuburbMeta) ([]m
 			break
 		}
 		if err != nil {
-			return nil, nil, fmt.Errorf("read road sections CSV row: %w", err)
+			return nil, fmt.Errorf("read road sections CSV row: %w", err)
 		}
 
-		roadID, err := strconv.Atoi(getCol(rec, colIdx, "road_id"))
+		roadID, err := strconv.Atoi(getColRaw(rec, colIdx, "road_id"))
 		if err != nil {
 			continue
 		}
-		roadSectionID, _ := strconv.Atoi(getCol(rec, colIdx, "road_section_id"))
-		fullRoadName := getCol(rec, colIdx, "full_road_name")
-		if fullRoadName == "" {
+		roadSectionID, _ := strconv.Atoi(getColRaw(rec, colIdx, "road_section_id"))
+		fullRoadNameRaw := getColRaw(rec, colIdx, "full_road_name")
+		if fullRoadNameRaw == "" {
 			continue
 		}
-		roadNameLabel := getCol(rec, colIdx, "road_name_label")
-		secondaryRoadName := getCol(rec, colIdx, "secondary_road_name")
-		tertiaryRoadName := getCol(rec, colIdx, "tertiary_road_name")
-		suburbLocality := getCol(rec, colIdx, "suburb_locality")
-		townCity := getCol(rec, colIdx, "town_city")
-		ta := getCol(rec, colIdx, "territorial_authority")
-		isLand := parseBool(getCol(rec, colIdx, "is_land"), true)
-		shapeStr := getShapeCol(rec, colIdx)
+		roadNameLabelRaw := getColRaw(rec, colIdx, "road_name_label")
+		secondaryRoadNameRaw := getColRaw(rec, colIdx, "secondary_road_name")
+		tertiaryRoadNameRaw := getColRaw(rec, colIdx, "tertiary_road_name")
 
-		// Maintain compact road_id -> RoadAliases map
+		// Maintain compact road_id -> RoadAliases map (cloning strings so CSV row buffer can be freed)
 		existingAlias := roadAliases[roadID]
-		if existingAlias.RoadNameLabel == "" && roadNameLabel != "" {
-			existingAlias.RoadNameLabel = roadNameLabel
+		updatedAlias := false
+		if existingAlias.RoadNameLabel == "" && roadNameLabelRaw != "" {
+			existingAlias.RoadNameLabel = strings.Clone(roadNameLabelRaw)
+			updatedAlias = true
 		}
-		if existingAlias.SecondaryRoadName == "" && secondaryRoadName != "" {
-			existingAlias.SecondaryRoadName = secondaryRoadName
+		if existingAlias.SecondaryRoadName == "" && secondaryRoadNameRaw != "" {
+			existingAlias.SecondaryRoadName = strings.Clone(secondaryRoadNameRaw)
+			updatedAlias = true
 		}
-		if existingAlias.TertiaryRoadName == "" && tertiaryRoadName != "" {
-			existingAlias.TertiaryRoadName = tertiaryRoadName
+		if existingAlias.TertiaryRoadName == "" && tertiaryRoadNameRaw != "" {
+			existingAlias.TertiaryRoadName = strings.Clone(tertiaryRoadNameRaw)
+			updatedAlias = true
 		}
-		roadAliases[roadID] = existingAlias
+		if updatedAlias {
+			roadAliases[roadID] = existingAlias
+		} else if _, exists := roadAliases[roadID]; !exists {
+			roadAliases[roadID] = existingAlias
+		}
 
-		dedupKey := fmt.Sprintf("%d|%s|%s", roadID, strings.ToLower(suburbLocality), strings.ToLower(townCity))
-		if _, exists := seenStreets[dedupKey]; exists {
+		suburbRaw := getColRaw(rec, colIdx, "suburb_locality")
+		townCityRaw := getColRaw(rec, colIdx, "town_city")
+
+		dedupHash := hashStreetKey(roadID, suburbRaw, townCityRaw)
+		if _, exists := seenStreets[dedupHash]; exists {
 			continue
 		}
-		seenStreets[dedupKey] = struct{}{}
+		seenStreets[dedupHash] = struct{}{}
+		seq++
 
-		meta := suburbs[NormalizeSuburbKey(suburbLocality)]
-		geo, _ := ParseWKTToGeo(shapeStr)
+		suburbLocality := strings.Clone(suburbRaw)
+		townCity := strings.Clone(townCityRaw)
+		meta := suburbs[ strings.ToLower(suburbLocality) ]
+		geo, _ := ParseWKTToGeo(getShapeColRaw(rec, colIdx))
 
 		docID := fmt.Sprintf("%d_%d", roadID, roadSectionID)
 		if roadSectionID == 0 {
-			docID = fmt.Sprintf("%d_%d", roadID, len(streets)+1)
+			docID = fmt.Sprintf("%d_%d", roadID, seq)
 		}
 
-		streets = append(streets, models.StreetDocument{
+		batch = append(batch, models.StreetDocument{
 			ID:                   docID,
 			RoadSectionID:        roadSectionID,
 			RoadID:               roadID,
-			FullRoadName:         fullRoadName,
-			RoadNameLabel:        roadNameLabel,
-			SecondaryRoadName:    secondaryRoadName,
-			TertiaryRoadName:     tertiaryRoadName,
+			FullRoadName:         strings.Clone(fullRoadNameRaw),
+			RoadNameLabel:        existingAlias.RoadNameLabel,
+			SecondaryRoadName:    existingAlias.SecondaryRoadName,
+			TertiaryRoadName:     existingAlias.TertiaryRoadName,
 			SuburbLocality:       suburbLocality,
 			SuburbAliases:        meta.AdditionalName,
 			TownCity:             townCity,
-			TerritorialAuthority: ta,
-			IsLand:               isLand,
+			TerritorialAuthority: getColCloned(rec, colIdx, "territorial_authority"),
+			IsLand:               parseBool(getColRaw(rec, colIdx, "is_land"), true),
 			PopulationEstimate:   meta.PopulationEstimate,
 			Geo:                  geo,
 		})
+
+		if len(batch) >= batchSize {
+			if err := onBatch(batch); err != nil {
+				return nil, err
+			}
+			clear(batch)
+			batch = batch[:0]
+		}
 	}
 
-	return streets, roadAliases, nil
+	if len(batch) > 0 {
+		if err := onBatch(batch); err != nil {
+			return nil, err
+		}
+		clear(batch)
+	}
+
+	return roadAliases, nil
+}
+
+func hashStreetKey(roadID int, suburb, town string) uint64 {
+	h := fnv.New64a()
+	var buf [24]byte
+	b := strconv.AppendInt(buf[:0], int64(roadID), 10)
+	_, _ = h.Write(b)
+	_, _ = h.Write([]byte{'|'})
+	_, _ = io.WriteString(h, strings.ToLower(suburb))
+	_, _ = h.Write([]byte{'|'})
+	_, _ = io.WriteString(h, strings.ToLower(town))
+	return h.Sum64()
 }
 
 // StreamAddressesCSV streams the LINZ NZ Addresses CSV (Layer 123113) in batches of batchSize,
@@ -390,41 +539,41 @@ func StreamAddressesCSV(
 			return total, fmt.Errorf("read addresses CSV row: %w", err)
 		}
 
-		addressID, err := strconv.Atoi(getCol(rec, colIdx, "address_id"))
+		addressID, err := strconv.Atoi(getColRaw(rec, colIdx, "address_id"))
 		if err != nil {
 			continue
 		}
-		roadID, _ := strconv.Atoi(getCol(rec, colIdx, "road_id"))
-		fullAddrNum := getCol(rec, colIdx, "full_address_number")
-		fullRoadName := getCol(rec, colIdx, "full_road_name")
-		fullAddr := getCol(rec, colIdx, "full_address")
-		ta := getCol(rec, colIdx, "territorial_authority")
-		unit := getCol(rec, colIdx, "unit")
-		addrNum, _ := strconv.Atoi(getCol(rec, colIdx, "address_number"))
-		addrNumSuffix := getCol(rec, colIdx, "address_number_suffix")
+		roadID, _ := strconv.Atoi(getColRaw(rec, colIdx, "road_id"))
+		fullAddrNum := getColCloned(rec, colIdx, "full_address_number")
+		fullRoadName := getColCloned(rec, colIdx, "full_road_name")
+		fullAddr := getColCloned(rec, colIdx, "full_address")
+		ta := getColCloned(rec, colIdx, "territorial_authority")
+		unit := getColCloned(rec, colIdx, "unit")
+		addrNum, _ := strconv.Atoi(getColRaw(rec, colIdx, "address_number"))
+		addrNumSuffix := getColCloned(rec, colIdx, "address_number_suffix")
 
 		var addrNumHigh *int
-		if highStr := getCol(rec, colIdx, "address_number_high"); highStr != "" {
+		if highStr := getColRaw(rec, colIdx, "address_number_high"); highStr != "" {
 			if highVal, err := strconv.Atoi(highStr); err == nil {
 				addrNumHigh = &highVal
 			}
 		}
 
-		roadName := getCol(rec, colIdx, "road_name")
-		roadNameType := getCol(rec, colIdx, "road_name_type")
-		roadNameSuffix := getCol(rec, colIdx, "road_name_suffix")
-		suburbLocality := getCol(rec, colIdx, "suburb_locality")
-		townCity := getCol(rec, colIdx, "town_city")
-		isLand := parseBool(getCol(rec, colIdx, "is_land"), true)
-		lifecycle := getCol(rec, colIdx, "address_lifecycle")
+		roadName := getColCloned(rec, colIdx, "road_name")
+		roadNameType := getColCloned(rec, colIdx, "road_name_type")
+		roadNameSuffix := getColCloned(rec, colIdx, "road_name_suffix")
+		suburbLocality := getColCloned(rec, colIdx, "suburb_locality")
+		townCity := getColCloned(rec, colIdx, "town_city")
+		isLand := parseBool(getColRaw(rec, colIdx, "is_land"), true)
+		lifecycle := getColCloned(rec, colIdx, "address_lifecycle")
 		if lifecycle == "" {
 			lifecycle = "Current"
 		}
-		shapeStr := getShapeCol(rec, colIdx)
+		shapeStr := getShapeColRaw(rec, colIdx)
 		geo, _ := ParseWKTToGeo(shapeStr)
 
 		roadMeta := roads[roadID]
-		suburbMeta := suburbs[NormalizeSuburbKey(suburbLocality)]
+		suburbMeta := suburbs[strings.ToLower(suburbLocality)]
 
 		batch = append(batch, models.AddressDocument{
 			AddressID:            addressID,
@@ -456,6 +605,7 @@ func StreamAddressesCSV(
 			if err := onBatch(batch); err != nil {
 				return total, err
 			}
+			clear(batch)
 			batch = batch[:0]
 		}
 	}
@@ -464,6 +614,7 @@ func StreamAddressesCSV(
 		if err := onBatch(batch); err != nil {
 			return total, err
 		}
+		clear(batch)
 	}
 
 	return total, nil
@@ -478,7 +629,9 @@ func buildColumnMap(header []string) map[string]int {
 	return m
 }
 
-func getCol(rec []string, colIdx map[string]int, name string) string {
+// getColRaw returns a trimmed substring slice of the CSV record without allocating.
+// Only use for transient parsing (e.g. strconv.Atoi, parseBool, or WKT scanning).
+func getColRaw(rec []string, colIdx map[string]int, name string) string {
 	idx, ok := colIdx[name]
 	if !ok || idx < 0 || idx >= len(rec) {
 		return ""
@@ -486,9 +639,19 @@ func getCol(rec []string, colIdx map[string]int, name string) string {
 	return strings.TrimSpace(rec[idx])
 }
 
-func getShapeCol(rec []string, colIdx map[string]int) string {
+// getColCloned returns an independently allocated copy of the trimmed CSV column string
+// so that retaining the string does not pin the entire CSV row buffer (including large WKT shapes) in memory.
+func getColCloned(rec []string, colIdx map[string]int, name string) string {
+	val := getColRaw(rec, colIdx, name)
+	if val == "" {
+		return ""
+	}
+	return strings.Clone(val)
+}
+
+func getShapeColRaw(rec []string, colIdx map[string]int) string {
 	for _, candidate := range []string{"shape", "wkt", "geom", "geometry", "the_geom"} {
-		if v := getCol(rec, colIdx, candidate); v != "" {
+		if v := getColRaw(rec, colIdx, candidate); v != "" {
 			return v
 		}
 	}

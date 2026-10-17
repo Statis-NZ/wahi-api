@@ -28,6 +28,7 @@ services:
       - meilisearch
     environment:
       - PORT=8080
+      - GOMEMLIMIT=200MiB
       - MEILI_HOST=http://meilisearch:7700
       - MEILI_API_KEY=${MEILI_MASTER_KEY:-change_me_in_production_min_16_bytes}
       - LINZ_API_KEY=${LINZ_API_KEY}

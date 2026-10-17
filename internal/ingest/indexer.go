@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime"
+	"runtime/debug"
 	"time"
 
 	"github.com/meilisearch/meilisearch-go"
@@ -192,16 +193,19 @@ func (idx *Indexer) ConfigureIndexes(ctx context.Context) error {
 	return nil
 }
 
-// IndexLocalities batch-inserts LocalityDocuments into the "localities" index.
+// IndexLocalities batch-inserts LocalityDocuments into the "localities" index using NDJSON.
 func (idx *Indexer) IndexLocalities(ctx context.Context, docs []models.LocalityDocument) error {
 	if len(docs) == 0 {
 		return nil
 	}
+	ndjsonBytes, err := encodeNDJSON(docs)
+	if err != nil {
+		return fmt.Errorf("encode localities NDJSON: %w", err)
+	}
 	pk := "id"
-	_, err := idx.Client.Index(IndexLocalities).AddDocumentsInBatchesWithContext(
+	_, err = idx.Client.Index(IndexLocalities).AddDocumentsNdjsonWithContext(
 		ctx,
-		docs,
-		idx.BatchSize,
+		ndjsonBytes,
 		&meilisearch.DocumentOptions{PrimaryKey: &pk},
 	)
 	if err != nil {
@@ -210,16 +214,19 @@ func (idx *Indexer) IndexLocalities(ctx context.Context, docs []models.LocalityD
 	return nil
 }
 
-// IndexStreets batch-inserts StreetDocuments into the "streets" index.
+// IndexStreets batch-inserts StreetDocuments into the "streets" index using NDJSON.
 func (idx *Indexer) IndexStreets(ctx context.Context, docs []models.StreetDocument) error {
 	if len(docs) == 0 {
 		return nil
 	}
+	ndjsonBytes, err := encodeNDJSON(docs)
+	if err != nil {
+		return fmt.Errorf("encode streets NDJSON: %w", err)
+	}
 	pk := "id"
-	_, err := idx.Client.Index(IndexStreets).AddDocumentsInBatchesWithContext(
+	_, err = idx.Client.Index(IndexStreets).AddDocumentsNdjsonWithContext(
 		ctx,
-		docs,
-		idx.BatchSize,
+		ndjsonBytes,
 		&meilisearch.DocumentOptions{PrimaryKey: &pk},
 	)
 	if err != nil {
@@ -228,32 +235,38 @@ func (idx *Indexer) IndexStreets(ctx context.Context, docs []models.StreetDocume
 	return nil
 }
 
-// IndexAddressBatch sends a batch of AddressDocuments to the "addresses" index using NDJSON.
+// IndexAddressBatch sends a batch of AddressDocuments to the "addresses" index using NDJSON,
+// chunking large batches into 10,000-document payloads to avoid large contiguous buffer allocations.
 func (idx *Indexer) IndexAddressBatch(ctx context.Context, batch []models.AddressDocument) error {
 	if len(batch) == 0 {
 		return nil
 	}
-	ndjsonBytes, err := encodeNDJSON(batch)
-	if err != nil {
-		return fmt.Errorf("encode addresses NDJSON: %w", err)
-	}
+	const maxChunk = 10000
 	pk := "address_id"
-	_, err = idx.Client.Index(IndexAddresses).AddDocumentsNdjsonWithContext(
-		ctx,
-		ndjsonBytes,
-		&meilisearch.DocumentOptions{PrimaryKey: &pk},
-	)
-	if err != nil {
-		return fmt.Errorf("index addresses batch: %w", err)
+	opts := &meilisearch.DocumentOptions{PrimaryKey: &pk}
+
+	for start := 0; start < len(batch); start += maxChunk {
+		end := start + maxChunk
+		if end > len(batch) {
+			end = len(batch)
+		}
+		ndjsonBytes, err := encodeNDJSON(batch[start:end])
+		if err != nil {
+			return fmt.Errorf("encode addresses NDJSON: %w", err)
+		}
+		if _, err := idx.Client.Index(IndexAddresses).AddDocumentsNdjsonWithContext(ctx, ndjsonBytes, opts); err != nil {
+			return fmt.Errorf("index addresses batch: %w", err)
+		}
 	}
 	return nil
 }
 
 func encodeNDJSON[T any](items []T) ([]byte, error) {
 	var buf bytes.Buffer
+	buf.Grow(len(items) * 256)
 	enc := json.NewEncoder(&buf)
 	for i := range items {
-		if err := enc.Encode(items[i]); err != nil {
+		if err := enc.Encode(&items[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -263,10 +276,14 @@ func encodeNDJSON[T any](items []T) ([]byte, error) {
 // RunPipeline executes the 3-phase LINZ ETL pipeline:
 // 1. Configure Meilisearch indexes & synonyms
 // 2. Load NZ Suburbs and Localities into memory & index into "localities"
-// 3. Load NZ Road Sections into memory, enrich with suburb populations/aliases & index into "streets"
+// 3. Stream NZ Road Sections, enrich with suburb populations/aliases & index into "streets"
 // 4. Stream NZ Addresses in batches of 50,000, enrich from in-memory maps & index into "addresses"
 // 5. Free in-memory maps once ingestion finishes.
 func (idx *Indexer) RunPipeline(ctx context.Context, cfg *config.Config, dl *Downloader) error {
+	// Set a soft Go memory limit of 180 MiB so the garbage collector stays well below
+	// the 256MB Docker container memory limit during streaming ETL.
+	debug.SetMemoryLimit(180 * 1024 * 1024)
+
 	slog.Info("configuring Meilisearch indexes and synonyms")
 	if err := idx.ConfigureIndexes(ctx); err != nil {
 		return err
@@ -287,24 +304,27 @@ func (idx *Indexer) RunPipeline(ctx context.Context, cfg *config.Config, dl *Dow
 	if err := idx.IndexLocalities(ctx, localityDocs); err != nil {
 		return err
 	}
-	localityDocs = nil // Free slice early
+	localityDocs = nil
+	runtime.GC()
 
-	// Step 3.2: Load NZ Addresses: Road Sections (Layer 123109)
+	// Step 3.2: Stream NZ Addresses: Road Sections (Layer 123109)
 	slog.Info("loading NZ Addresses: Road Sections", "layer", LayerRoadSections, "local_path", cfg.RoadsCSVPath)
 	roadsRC, err := dl.OpenLayerCSV(ctx, LayerRoadSections, cfg.RoadsCSVPath)
 	if err != nil {
 		return err
 	}
-	streetDocs, roadMap, err := LoadRoadSectionsCSV(roadsRC, suburbMap)
+	totalStreets := 0
+	roadMap, err := StreamRoadSectionsCSV(roadsRC, suburbMap, 10000, func(batch []models.StreetDocument) error {
+		totalStreets += len(batch)
+		slog.Info("indexing deduplicated streets batch into Meilisearch", "batch_size", len(batch), "total_streets", totalStreets)
+		return idx.IndexStreets(ctx, batch)
+	})
 	_ = roadsRC.Close()
 	if err != nil {
 		return err
 	}
-	slog.Info("indexing deduplicated streets into Meilisearch", "count", len(streetDocs))
-	if err := idx.IndexStreets(ctx, streetDocs); err != nil {
-		return err
-	}
-	streetDocs = nil // Free slice early
+	slog.Info("completed indexing streets", "total_unique_streets", totalStreets, "road_ids", len(roadMap))
+	runtime.GC()
 
 	// Step 3.3: Stream NZ Addresses (Layer 123113)
 	slog.Info("streaming NZ Addresses", "layer", LayerAddresses, "local_path", cfg.AddressesCSVPath, "batch_size", idx.BatchSize)
@@ -317,7 +337,7 @@ func (idx *Indexer) RunPipeline(ctx context.Context, cfg *config.Config, dl *Dow
 	batchNum := 0
 	totalAddresses, err := StreamAddressesCSV(addrRC, suburbMap, roadMap, idx.BatchSize, func(batch []models.AddressDocument) error {
 		batchNum++
-		slog.Info("sending address batch to Meilisearch", "batch", batchNum, "size", len(batch))
+		slog.Info("sending address batch to Meilisearch", "batch", batchNum, "size", len(batch), "total_sent", batchNum*len(batch))
 		return idx.IndexAddressBatch(ctx, batch)
 	})
 	if err != nil {
@@ -328,6 +348,7 @@ func (idx *Indexer) RunPipeline(ctx context.Context, cfg *config.Config, dl *Dow
 	suburbMap = nil
 	roadMap = nil
 	runtime.GC()
+	debug.FreeOSMemory()
 
 	slog.Info("ingestion pipeline completed", "total_addresses", totalAddresses)
 	return nil

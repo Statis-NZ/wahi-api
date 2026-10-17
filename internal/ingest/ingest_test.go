@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -225,4 +227,33 @@ func TestDownloaderWFSURL(t *testing.T) {
 		t.Errorf("expected data.linz.govt.nz:layer-113764 in WFS URL, got %s", u)
 	}
 }
+
+func TestLiveSuburbsMemory(t *testing.T) {
+	if os.Getenv("TEST_LIVE_LINZ") == "" {
+		t.Skip("skipping live LINZ stream test; set TEST_LIVE_LINZ=1 to run")
+	}
+	debug.SetMemoryLimit(180 * 1024 * 1024)
+	_ = os.Chdir(filepath.Join("..", ".."))
+	cfg := config.Load()
+	if cfg.LINZAPIKey == "" {
+		t.Skip("no LINZ_API_KEY")
+	}
+	dl := NewDownloader(cfg.LINZBaseURL, cfg.LINZAPIKey)
+
+	rc, err := dl.OpenLayerCSV(context.Background(), LayerSuburbs, "")
+	if err != nil {
+		t.Fatalf("OpenLayerCSV: %v", err)
+	}
+	defer rc.Close()
+
+	docs, suburbMap, err := LoadSuburbsCSV(rc)
+	if err != nil {
+		t.Fatalf("LoadSuburbsCSV: %v", err)
+	}
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	t.Logf("Loaded %d localities, %d suburb keys | HeapAlloc=%d MiB, HeapInuse=%d MiB, Sys=%d MiB",
+		len(docs), len(suburbMap), ms.HeapAlloc/1024/1024, ms.HeapInuse/1024/1024, ms.Sys/1024/1024)
+}
+
 
