@@ -1,0 +1,36 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/
+dist/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the rule if using vendoring)
+vendor/
+
+# Go workspace file
+go.work
+
+# Environment variables / local secrets
+.env
+*.local
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Data directory contents (keep the directory and .keep file)
+/data/*
+!/data/.keep
