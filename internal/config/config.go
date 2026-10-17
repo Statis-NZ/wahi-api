@@ -145,7 +145,7 @@ func loadDotEnv(path string) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
@@ -164,7 +164,7 @@ func loadDotEnvOverwriteKeys(path string, targetKeys ...string) {
 	if err != nil {
 		return
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	targets := make(map[string]struct{}, len(targetKeys))
 	for _, k := range targetKeys {

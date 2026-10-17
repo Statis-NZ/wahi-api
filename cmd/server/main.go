@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/meilisearch/meilisearch-go"
+	meilisearch "github.com/meilisearch/meilisearch-go"
 	"github.com/statis/wahi-api/internal/api"
 	"github.com/statis/wahi-api/internal/config"
 	"github.com/statis/wahi-api/internal/ingest"

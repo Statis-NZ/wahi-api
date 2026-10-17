@@ -96,7 +96,7 @@ func (d *Downloader) streamURL(ctx context.Context, reqURL string) (io.ReadClose
 		return nil, fmt.Errorf("execute LINZ WFS request: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("LINZ WFS request failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
 	}

@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/danielgtaylor/huma/v2"
-	"github.com/meilisearch/meilisearch-go"
+	huma "github.com/danielgtaylor/huma/v2"
+	meilisearch "github.com/meilisearch/meilisearch-go"
 	"github.com/statis/wahi-api/internal/ingest"
 	"github.com/statis/wahi-api/internal/models"
 )

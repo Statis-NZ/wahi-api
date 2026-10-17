@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/meilisearch/meilisearch-go"
+	meilisearch "github.com/meilisearch/meilisearch-go"
 	"github.com/statis/wahi-api/internal/config"
 )
 
@@ -433,4 +433,3 @@ func TestCORSStrictAndWildcardSubdomains(t *testing.T) {
 		t.Fatalf("expected 403 Forbidden for disallowed Origin under CORS_STRICT, got %d", recBlocked.Code)
 	}
 }
-

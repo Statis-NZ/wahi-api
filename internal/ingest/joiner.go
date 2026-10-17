@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/statis/wahi-api/internal/models"
-	"github.com/twpayne/go-geom"
+	geom "github.com/twpayne/go-geom"
 	"github.com/twpayne/go-geom/encoding/wkt"
 )
 
@@ -448,7 +448,7 @@ func StreamRoadSectionsCSV(
 
 		suburbLocality := strings.Clone(suburbRaw)
 		townCity := strings.Clone(townCityRaw)
-		meta := suburbs[ strings.ToLower(suburbLocality) ]
+		meta := suburbs[strings.ToLower(suburbLocality)]
 		geo, _ := ParseWKTToGeo(getShapeColRaw(rec, colIdx))
 
 		docID := fmt.Sprintf("%d_%d", roadID, roadSectionID)

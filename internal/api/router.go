@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/danielgtaylor/huma/v2"
+	huma "github.com/danielgtaylor/huma/v2"
 	"github.com/danielgtaylor/huma/v2/adapters/humago"
-	"github.com/meilisearch/meilisearch-go"
+	meilisearch "github.com/meilisearch/meilisearch-go"
 	"github.com/statis/wahi-api/internal/config"
 )
 
@@ -38,9 +38,9 @@ func NewServer(cfg *config.Config, meiliClient meilisearch.ServiceManager) *Serv
 		humaCfg.Components.SecuritySchemes = make(map[string]*huma.SecurityScheme)
 	}
 	humaCfg.Components.SecuritySchemes["BearerAuth"] = &huma.SecurityScheme{
-		Type:         "http",
-		Scheme:       "bearer",
-		Description:  "Access token passed via Authorization: Bearer <token>",
+		Type:        "http",
+		Scheme:      "bearer",
+		Description: "Access token passed via Authorization: Bearer <token>",
 	}
 	humaCfg.Components.SecuritySchemes["ApiKeyHeader"] = &huma.SecurityScheme{
 		Type:        "apiKey",
