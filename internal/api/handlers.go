@@ -125,15 +125,72 @@ func (s *Server) handleAutosuggest(ctx context.Context, input *AutosuggestInput)
 	out := &AutosuggestOutput{}
 	out.Body.Results = make([]models.AutosuggestItem, 0)
 
-	// Case A: Query starts with a street number (or caller specifically requested only addresses/streets/localities)
+	// Case A: Query starts with a street number (or caller specifically requested only addresses)
 	if parsed.HasStreetNumber || reqType == "address" {
-		addrFilter := buildAddressFilter(parsed, input.TownCity, input.IncludeProposed, hasGeo, input.Lat, input.Lon)
 		searchQuery := buildAddressSearchText(parsed)
 
+		if parsed.HasStreetNumber && parsed.NumberHigh == nil {
+			exactFilter := buildAddressFilterWithNumberClause(parsed.BuildExactAddressNumberFilter(), parsed, input.TownCity, input.IncludeProposed, hasGeo, input.Lat, input.Lon)
+			exactResp, err := s.Meili.Index(ingest.IndexAddresses).SearchWithContext(ctx, searchQuery, &meilisearch.SearchRequest{
+				Limit:            int64(limit),
+				Filter:           exactFilter,
+				Sort:             geoSort,
+				MatchingStrategy: meilisearch.All,
+			})
+			if err != nil {
+				return nil, huma.Error502BadGateway("Meilisearch address search failed", err)
+			}
+			items, err := decodeAddressHits(exactResp.Hits)
+			if err != nil {
+				return nil, huma.Error500InternalServerError("Failed to decode address hits", err)
+			}
+			maxProcMs := exactResp.ProcessingTimeMs
+
+			if len(items) < limit {
+				rangeFilter := buildAddressFilterWithNumberClause(parsed.BuildRangeAddressNumberFilter(), parsed, input.TownCity, input.IncludeProposed, hasGeo, input.Lat, input.Lon)
+				rangeResp, err := s.Meili.Index(ingest.IndexAddresses).SearchWithContext(ctx, searchQuery, &meilisearch.SearchRequest{
+					Limit:            int64(limit),
+					Filter:           rangeFilter,
+					Sort:             geoSort,
+					MatchingStrategy: meilisearch.All,
+				})
+				if err != nil {
+					return nil, huma.Error502BadGateway("Meilisearch address search failed", err)
+				}
+				if rangeResp.ProcessingTimeMs > maxProcMs {
+					maxProcMs = rangeResp.ProcessingTimeMs
+				}
+				rangeItems, err := decodeAddressHits(rangeResp.Hits)
+				if err != nil {
+					return nil, huma.Error500InternalServerError("Failed to decode address hits", err)
+				}
+				seen := make(map[int]struct{}, len(items))
+				for _, item := range items {
+					seen[item.ID] = struct{}{}
+				}
+				for _, item := range rangeItems {
+					if _, exists := seen[item.ID]; exists {
+						continue
+					}
+					seen[item.ID] = struct{}{}
+					items = append(items, item)
+					if len(items) >= limit {
+						break
+					}
+				}
+			}
+
+			out.Body.Results = items
+			out.Body.QueryTimeMs = maxInt64(maxProcMs, time.Since(start).Milliseconds())
+			return out, nil
+		}
+
+		addrFilter := buildAddressFilter(parsed, input.TownCity, input.IncludeProposed, hasGeo, input.Lat, input.Lon)
 		resp, err := s.Meili.Index(ingest.IndexAddresses).SearchWithContext(ctx, searchQuery, &meilisearch.SearchRequest{
-			Limit:  int64(limit),
-			Filter: addrFilter,
-			Sort:   geoSort,
+			Limit:            int64(limit),
+			Filter:           addrFilter,
+			Sort:             geoSort,
+			MatchingStrategy: meilisearch.All,
 		})
 		if err != nil {
 			return nil, huma.Error502BadGateway("Meilisearch address search failed", err)
@@ -148,12 +205,14 @@ func (s *Server) handleAutosuggest(ctx context.Context, input *AutosuggestInput)
 		return out, nil
 	}
 
-	if reqType == "street" {
+	// Case B: Caller requested streets OR query has an unambiguous road type suffix/prefix (e.g. "queen st", "ponsonby rd")
+	if reqType == "street" || (reqType == "all" && parsed.HasRoadType) {
 		streetFilter := buildStreetFilter(input.TownCity, hasGeo, input.Lat, input.Lon)
 		resp, err := s.Meili.Index(ingest.IndexStreets).SearchWithContext(ctx, parsed.Raw, &meilisearch.SearchRequest{
-			Limit:  int64(limit),
-			Filter: streetFilter,
-			Sort:   geoSort,
+			Limit:            int64(limit),
+			Filter:           streetFilter,
+			Sort:             geoSort,
+			MatchingStrategy: meilisearch.All,
 		})
 		if err != nil {
 			return nil, huma.Error502BadGateway("Meilisearch street search failed", err)
@@ -167,12 +226,14 @@ func (s *Server) handleAutosuggest(ctx context.Context, input *AutosuggestInput)
 		return out, nil
 	}
 
+	// Case C: Caller specifically requested only localities
 	if reqType == "locality" {
 		locFilter := buildLocalityFilter(input.TownCity, hasGeo, input.Lat, input.Lon)
 		resp, err := s.Meili.Index(ingest.IndexLocalities).SearchWithContext(ctx, parsed.Raw, &meilisearch.SearchRequest{
-			Limit:  int64(limit),
-			Filter: locFilter,
-			Sort:   geoSort,
+			Limit:            int64(limit),
+			Filter:           locFilter,
+			Sort:             geoSort,
+			MatchingStrategy: meilisearch.All,
 		})
 		if err != nil {
 			return nil, huma.Error502BadGateway("Meilisearch locality search failed", err)
@@ -186,34 +247,28 @@ func (s *Server) handleAutosuggest(ctx context.Context, input *AutosuggestInput)
 		return out, nil
 	}
 
-	// Case B: Query has NO leading street number and type == "all"
-	// Execute a single MultiSearch call across localities (limit 3), streets (limit 5), and addresses (limit `limit`).
+	// Case D: General text query with NO street number and NO road type (e.g. "ponsonby", "auckland central")
+	// Search localities (limit 5) and streets (limit `limit`) without random numbered house addresses.
 	locFilter := buildLocalityFilter(input.TownCity, hasGeo, input.Lat, input.Lon)
 	streetFilter := buildStreetFilter(input.TownCity, hasGeo, input.Lat, input.Lon)
-	addrFilter := buildAddressFilter(parsed, input.TownCity, input.IncludeProposed, hasGeo, input.Lat, input.Lon)
 
 	multiResp, err := s.Meili.MultiSearchWithContext(ctx, &meilisearch.MultiSearchRequest{
 		Queries: []*meilisearch.SearchRequest{
 			{
-				IndexUID: ingest.IndexLocalities,
-				Query:    parsed.Raw,
-				Limit:    3,
-				Filter:   locFilter,
-				Sort:     geoSort,
+				IndexUID:         ingest.IndexLocalities,
+				Query:            parsed.Raw,
+				Limit:            5,
+				Filter:           locFilter,
+				Sort:             geoSort,
+				MatchingStrategy: meilisearch.All,
 			},
 			{
-				IndexUID: ingest.IndexStreets,
-				Query:    parsed.Raw,
-				Limit:    5,
-				Filter:   streetFilter,
-				Sort:     geoSort,
-			},
-			{
-				IndexUID: ingest.IndexAddresses,
-				Query:    parsed.Raw,
-				Limit:    int64(limit),
-				Filter:   addrFilter,
-				Sort:     geoSort,
+				IndexUID:         ingest.IndexStreets,
+				Query:            parsed.Raw,
+				Limit:            int64(limit),
+				Filter:           streetFilter,
+				Sort:             geoSort,
+				MatchingStrategy: meilisearch.All,
 			},
 		},
 	})
@@ -234,8 +289,6 @@ func (s *Server) handleAutosuggest(ctx context.Context, input *AutosuggestInput)
 			items, _ = decodeLocalityHits(res.Hits)
 		case ingest.IndexStreets:
 			items, _ = decodeStreetHits(res.Hits)
-		case ingest.IndexAddresses:
-			items, _ = decodeAddressHits(res.Hits)
 		}
 		for _, item := range items {
 			key := fmt.Sprintf("%s:%d:%s", item.Type, item.ID, strings.ToLower(item.FullAddress))
@@ -380,26 +433,32 @@ func (s *Server) handleHealthz(ctx context.Context, _ *struct{}) (*HealthzOutput
 	return out, nil
 }
 
-// buildAddressSearchText orders the street query before the unit/number token so Meilisearch's
-// default "last" word-matching strategy ranks exact full_address_number matches first while still
-// returning ranged addresses (e.g., 100-120 for query "110 Queen St") via the numeric filter.
+// buildAddressSearchText returns the searchable text for an address query.
+// When a street number is present, numeric range, unit, and suffix matching are enforced
+// by buildAddressFilter so that ranged addresses (e.g., 1/100A-120A for query "1/110 Queen St")
+// are not excluded by strict MatchingStrategy: All token matching on intermediate house numbers,
+// and the trailing street token stays last for prefix matching while typing (e.g. "1/110 Qu").
 func buildAddressSearchText(parsed ParsedQuery) string {
-	if !parsed.HasStreetNumber || parsed.StreetQuery == "" {
+	if !parsed.HasStreetNumber {
 		return parsed.Raw
 	}
-	var parts []string
-	parts = append(parts, parsed.StreetQuery)
-	if parsed.Unit != "" {
-		parts = append(parts, parsed.Unit)
-	}
-	parts = append(parts, fmt.Sprintf("%d%s", parsed.Number, parsed.NumberSuffix))
-	return strings.Join(parts, " ")
+	return parsed.StreetQuery
 }
 
 func buildAddressFilter(parsed ParsedQuery, townCity string, includeProposed, hasGeo bool, lat, lon float64) string {
+	return buildAddressFilterWithNumberClause(parsed.BuildAddressNumberFilter(), parsed, townCity, includeProposed, hasGeo, lat, lon)
+}
+
+func buildAddressFilterWithNumberClause(numFilter string, parsed ParsedQuery, townCity string, includeProposed, hasGeo bool, lat, lon float64) string {
 	var clauses []string
-	if numFilter := parsed.BuildAddressNumberFilter(); numFilter != "" {
+	if numFilter != "" {
 		clauses = append(clauses, numFilter)
+	}
+	if parsed.Unit != "" {
+		clauses = append(clauses, fmt.Sprintf("unit = %q", parsed.Unit))
+	}
+	if parsed.NumberSuffix != "" {
+		clauses = append(clauses, fmt.Sprintf("address_number_suffix = %q", parsed.NumberSuffix))
 	}
 	if !includeProposed {
 		clauses = append(clauses, `address_lifecycle = "Current"`)
