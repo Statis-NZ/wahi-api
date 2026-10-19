@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"testing"
+	"time"
 
 	meilisearch "github.com/meilisearch/meilisearch-go"
 	"github.com/statis/wahi-api/internal/config"
@@ -160,9 +161,21 @@ func TestIndexSettingsNoWildcard(t *testing.T) {
 				t.Errorf("wildcard '*' is prohibited in FilterableAttributes")
 			}
 		}
-		if len(s.Synonyms) == 0 || s.Synonyms["st"][0] != "street" {
-			t.Errorf("expected NZ road synonyms dictionary to be configured")
+		if len(s.Synonyms) == 0 {
+			t.Errorf("expected synonyms dictionary to be configured")
 		}
+		if _, hasReverseSt := s.Synonyms["street"]; hasReverseSt {
+			t.Errorf("unexpected reverse 'street' -> 'st' synonym that causes 2-letter prefix false positives")
+		}
+	}
+	if AddressesIndexSettings().Synonyms["st"][0] != "street" {
+		t.Errorf("expected AddressesIndexSettings to map 'st' to 'street'")
+	}
+	if _, hasMt := AddressesIndexSettings().Synonyms["mt"]; hasMt {
+		t.Errorf("expected locality synonym 'mt' to be excluded from DefaultSynonyms")
+	}
+	if LocalitiesIndexSettings().Synonyms["st"][0] != "saint" {
+		t.Errorf("expected LocalitiesIndexSettings to map 'st' to 'saint'")
 	}
 }
 
@@ -218,6 +231,84 @@ func TestRunPipelineWithMockMeilisearch(t *testing.T) {
 	if err := indexer.RunPipeline(context.Background(), cfg, dl); err != nil {
 		t.Fatalf("RunPipeline failed: %v", err)
 	}
+}
+
+func TestConfigureIndexesWithRetry(t *testing.T) {
+	attempts := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/indexes", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"taskUid":1,"indexUid":"addresses","status":"enqueued"}`))
+	})
+	mux.HandleFunc("/indexes/", func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts <= 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"message":"Meilisearch starting up"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"taskUid":1,"status":"enqueued"}`))
+	})
+	mux.HandleFunc("/tasks/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"uid":1,"status":"succeeded"}`))
+	})
+
+	httpClient := &http.Client{
+		Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+			return rec.Result(), nil
+		}),
+	}
+
+	client := meilisearch.New(
+		"http://meili.local",
+		meilisearch.WithAPIKey("test_key"),
+		meilisearch.WithCustomClient(httpClient),
+	)
+	indexer := NewIndexer(client, 100)
+
+	if err := indexer.ConfigureIndexesWithRetry(context.Background(), 5*time.Millisecond, 20*time.Millisecond); err != nil {
+		t.Fatalf("expected ConfigureIndexesWithRetry to succeed after transient errors, got: %v", err)
+	}
+	if attempts < 3 {
+		t.Errorf("expected at least 3 settings requests across retries, got %d", attempts)
+	}
+
+	t.Run("fails fast on permanent 4xx Meilisearch error without retrying", func(t *testing.T) {
+		authAttempts := 0
+		authMux := http.NewServeMux()
+		authMux.HandleFunc("/indexes/", func(w http.ResponseWriter, r *http.Request) {
+			authAttempts++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"message":"The provided API key is invalid.","code":"invalid_api_key","type":"auth"}`))
+		})
+		authClient := meilisearch.New(
+			"http://meili.local",
+			meilisearch.WithAPIKey("bad_key"),
+			meilisearch.WithCustomClient(&http.Client{
+				Transport: roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+					rec := httptest.NewRecorder()
+					authMux.ServeHTTP(rec, req)
+					return rec.Result(), nil
+				}),
+			}),
+		)
+		authIndexer := NewIndexer(authClient, 100)
+		if err := authIndexer.ConfigureIndexesWithRetry(context.Background(), 5*time.Millisecond, 20*time.Millisecond); err == nil {
+			t.Fatal("expected error on 403 invalid API key")
+		}
+		if authAttempts != 1 {
+			t.Errorf("expected exactly 1 settings request for permanent 403 error, got %d", authAttempts)
+		}
+	})
 }
 
 func TestDownloaderWFSURL(t *testing.T) {

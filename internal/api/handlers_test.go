@@ -2,14 +2,20 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode"
 
 	meilisearch "github.com/meilisearch/meilisearch-go"
 	"github.com/statis/wahi-api/internal/config"
+	"github.com/statis/wahi-api/internal/ingest"
+	"github.com/statis/wahi-api/internal/models"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -18,13 +24,215 @@ func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
 	return f(r)
 }
 
+var (
+	singleNumFilterRe = regexp.MustCompile(`\(address_number = (\d+) OR \(address_number <= \d+ AND address_number_high >= \d+\)\)`)
+	rangeNumFilterRe  = regexp.MustCompile(`\(address_number <= (\d+) AND address_number_high >= (\d+)\)`)
+	exactNumFilterRe  = regexp.MustCompile(`\(address_number = (\d+) AND \(address_number_high NOT EXISTS OR address_number_high IS NULL\)\)`)
+	unitFilterRe      = regexp.MustCompile(`unit = "([^"]+)"`)
+	suffixFilterRe    = regexp.MustCompile(`address_number_suffix = "([^"]+)"`)
+)
+
+func tokenizeForTest(s string) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, tok := range strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if tok != "" {
+			out[tok] = struct{}{}
+		}
+	}
+	return out
+}
+
+func matchesMockAddressSearch(doc models.AddressDocument, q, filter, matchingStrategy string) bool {
+	if m := singleNumFilterRe.FindStringSubmatch(filter); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		exact := doc.AddressNumber == n
+		inRange := doc.AddressNumberHigh != nil && doc.AddressNumber <= n && *doc.AddressNumberHigh >= n
+		if !exact && !inRange {
+			return false
+		}
+	} else if m := rangeNumFilterRe.FindStringSubmatch(filter); m != nil {
+		low, _ := strconv.Atoi(m[1])
+		high, _ := strconv.Atoi(m[2])
+		if doc.AddressNumberHigh == nil || doc.AddressNumber > low || *doc.AddressNumberHigh < high {
+			return false
+		}
+	} else if m := exactNumFilterRe.FindStringSubmatch(filter); m != nil {
+		n, _ := strconv.Atoi(m[1])
+		if doc.AddressNumber != n || doc.AddressNumberHigh != nil {
+			return false
+		}
+	}
+	if m := unitFilterRe.FindStringSubmatch(filter); m != nil {
+		if !strings.EqualFold(doc.Unit, m[1]) {
+			return false
+		}
+	}
+	if m := suffixFilterRe.FindStringSubmatch(filter); m != nil {
+		if !strings.EqualFold(doc.AddressNumberSuffix, m[1]) {
+			return false
+		}
+	}
+	if strings.Contains(filter, `address_lifecycle = "Current"`) && doc.AddressLifecycle != "Current" {
+		return false
+	}
+
+	if strings.TrimSpace(q) == "" {
+		return true
+	}
+
+	docText := strings.Join([]string{
+		doc.FullAddressNumber,
+		doc.FullRoadName,
+		doc.RoadNameLabel,
+		doc.SecondaryRoadName,
+		doc.SuburbLocality,
+		doc.SuburbAliases,
+		doc.TownCity,
+	}, " ")
+	docTokens := tokenizeForTest(docText)
+	synonyms := ingest.DefaultSynonyms()
+
+	qTokens := strings.FieldsFunc(strings.ToLower(q), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	for i, qt := range qTokens {
+		isLastToken := i == len(qTokens)-1
+		matched := false
+		if _, ok := docTokens[qt]; ok {
+			matched = true
+		}
+		if !matched && isLastToken {
+			for dt := range docTokens {
+				if strings.HasPrefix(dt, qt) {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			for _, syn := range synonyms[qt] {
+				if _, ok := docTokens[strings.ToLower(syn)]; ok {
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched && matchingStrategy == string(meilisearch.All) {
+			return false
+		}
+	}
+	return true
+}
+
 func newTestServer(t *testing.T, rps float64, burst int) (*Server, *[]string) {
 	t.Helper()
 
 	var recordedBodies []string
+	high120 := 120
+	fixtureAddresses := []models.AddressDocument{
+		{
+			AddressID:           3000000,
+			RoadID:              1000000,
+			FullAddressNumber:   "1/100A-120A",
+			FullRoadName:        "Queen Street West",
+			FullAddress:         "1/100A-120A, Queen Street West, Auckland Central, Auckland",
+			Unit:                "1",
+			AddressNumber:       100,
+			AddressNumberSuffix: "A",
+			AddressNumberHigh:   &high120,
+			RoadName:            "Queen",
+			RoadNameType:        "Street",
+			RoadNameSuffix:      "West",
+			RoadNameLabel:       "Queen St W",
+			SuburbLocality:      "Auckland Central",
+			TownCity:            "Auckland",
+			AddressLifecycle:    "Current",
+			Geo:                 &models.MeiliGeo{Lat: -36.8485, Lng: 174.7633},
+		},
+		{
+			AddressID:         3000001,
+			RoadID:            1000000,
+			FullAddressNumber: "2/110",
+			FullRoadName:      "Queen Street West",
+			FullAddress:       "2/110, Queen Street West, Auckland Central, Auckland",
+			Unit:              "2",
+			AddressNumber:     110,
+			RoadName:          "Queen",
+			RoadNameType:      "Street",
+			RoadNameSuffix:    "West",
+			RoadNameLabel:     "Queen St W",
+			SuburbLocality:    "Auckland Central",
+			TownCity:          "Auckland",
+			AddressLifecycle:  "Current",
+			Geo:               &models.MeiliGeo{Lat: -36.8488, Lng: 174.7635},
+		},
+		{
+			AddressID:           3000002,
+			RoadID:              1000001,
+			FullAddressNumber:   "15B",
+			FullRoadName:        "Ponsonby Road",
+			FullAddress:         "15B, Ponsonby Road, Ponsonby, Auckland",
+			AddressNumber:       15,
+			AddressNumberSuffix: "B",
+			RoadName:            "Ponsonby",
+			RoadNameType:        "Road",
+			RoadNameLabel:       "Ponsonby Rd",
+			SuburbLocality:      "Ponsonby",
+			TownCity:            "Auckland",
+			AddressLifecycle:    "Current",
+			Geo:                 &models.MeiliGeo{Lat: -36.8520, Lng: 174.7460},
+		},
+		{
+			AddressID:           3000005,
+			RoadID:              1000000,
+			FullAddressNumber:   "100A",
+			FullRoadName:        "Queen Street West",
+			FullAddress:         "100A, Queen Street West, Auckland Central, Auckland",
+			AddressNumber:       100,
+			AddressNumberSuffix: "A",
+			RoadName:            "Queen",
+			RoadNameType:        "Street",
+			RoadNameSuffix:      "West",
+			RoadNameLabel:       "Queen St W",
+			SuburbLocality:      "Auckland Central",
+			TownCity:            "Auckland",
+			AddressLifecycle:    "Current",
+			Geo:                 &models.MeiliGeo{Lat: -36.8486, Lng: 174.7634},
+		},
+	}
 
 	meiliMux := http.NewServeMux()
 	meiliMux.HandleFunc("/indexes/addresses/search", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		recordedBodies = append(recordedBodies, string(body))
+
+		var reqPayload struct {
+			Q                string `json:"q"`
+			Filter           string `json:"filter"`
+			Limit            int    `json:"limit"`
+			MatchingStrategy string `json:"matchingStrategy"`
+		}
+		_ = json.Unmarshal(body, &reqPayload)
+
+		matched := make([]models.AddressDocument, 0)
+		for _, doc := range fixtureAddresses {
+			if matchesMockAddressSearch(doc, reqPayload.Q, reqPayload.Filter, reqPayload.MatchingStrategy) {
+				matched = append(matched, doc)
+				if reqPayload.Limit > 0 && len(matched) >= reqPayload.Limit {
+					break
+				}
+			}
+		}
+
+		hitsJSON, _ := json.Marshal(matched)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = fmt.Fprintf(w, `{"hits":%s,"processingTimeMs":2,"query":%q}`, string(hitsJSON), reqPayload.Q)
+	})
+
+	meiliMux.HandleFunc("/indexes/streets/search", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		recordedBodies = append(recordedBodies, string(body))
 		w.Header().Set("Content-Type", "application/json")
@@ -32,18 +240,16 @@ func newTestServer(t *testing.T, rps float64, burst int) (*Server, *[]string) {
 		_, _ = w.Write([]byte(`{
 			"hits": [
 				{
-					"address_id": 3000000,
+					"id": "1000000_2000001",
 					"road_id": 1000000,
-					"full_address_number": "1/100A-120A",
-					"full_road_name": "Queen Street West",
-					"full_address": "1/100A-120A, Queen Street West, Auckland Central, Auckland",
+					"full_road_name": "Queen Street",
 					"suburb_locality": "Auckland Central",
 					"town_city": "Auckland",
 					"_geo": {"lat": -36.8485, "lng": 174.7633}
 				}
 			],
 			"processingTimeMs": 2,
-			"query": "Queen St 1 110"
+			"query": "Queen St"
 		}`))
 	})
 
@@ -74,22 +280,6 @@ func newTestServer(t *testing.T, rps float64, burst int) (*Server, *[]string) {
 							"id": "1000001_2000003",
 							"road_id": 1000001,
 							"full_road_name": "Ponsonby Road",
-							"suburb_locality": "Ponsonby",
-							"town_city": "Auckland",
-							"_geo": {"lat": -36.8520, "lng": 174.7460}
-						}
-					]
-				},
-				{
-					"indexUid": "addresses",
-					"processingTimeMs": 3,
-					"hits": [
-						{
-							"address_id": 3000002,
-							"road_id": 1000001,
-							"full_address_number": "15B",
-							"full_road_name": "Ponsonby Road",
-							"full_address": "15B, Ponsonby Road, Ponsonby, Auckland",
 							"suburb_locality": "Ponsonby",
 							"town_city": "Auckland",
 							"_geo": {"lat": -36.8520, "lng": 174.7460}
@@ -180,7 +370,209 @@ func newTestServer(t *testing.T, rps float64, burst int) (*Server, *[]string) {
 func TestAutosuggestWithStreetNumber(t *testing.T) {
 	srv, bodies := newTestServer(t, 50, 100)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=1/110+Queen+St&lat=-36.8485&lon=174.7633", nil)
+	t.Run("ranged address with unit matches under strict MatchingStrategy All", func(t *testing.T) {
+		*bodies = nil
+		req := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=1/110+Queen+St&lat=-36.8485&lon=174.7633", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		if len(*bodies) < 2 {
+			t.Fatalf("expected exact and fallback range search request bodies, got %d", len(*bodies))
+		}
+		var exactReq, rangeReq struct {
+			Filter           string `json:"filter"`
+			Q                string `json:"q"`
+			MatchingStrategy string `json:"matchingStrategy"`
+		}
+		if err := json.Unmarshal([]byte((*bodies)[0]), &exactReq); err != nil {
+			t.Fatalf("unmarshal exact search request: %v", err)
+		}
+		if err := json.Unmarshal([]byte((*bodies)[1]), &rangeReq); err != nil {
+			t.Fatalf("unmarshal range search request: %v", err)
+		}
+		if exactReq.MatchingStrategy != string(meilisearch.All) || rangeReq.MatchingStrategy != string(meilisearch.All) {
+			t.Errorf("expected matchingStrategy %q, got exact=%q range=%q", meilisearch.All, exactReq.MatchingStrategy, rangeReq.MatchingStrategy)
+		}
+		if !strings.Contains(exactReq.Filter, "address_number = 110") {
+			t.Errorf("expected exact filter in first request, got %q", exactReq.Filter)
+		}
+		if !strings.Contains(rangeReq.Filter, "address_number <= 110 AND address_number_high >= 110") {
+			t.Errorf("expected range filter in second request, got %q", rangeReq.Filter)
+		}
+		if !strings.Contains(rangeReq.Filter, `unit = "1"`) {
+			t.Errorf("expected unit filter in Meilisearch request filter, got %q", rangeReq.Filter)
+		}
+		if !strings.Contains(rangeReq.Filter, "_geoRadius(-36.848500, 174.763300, 50000)") {
+			t.Errorf("expected _geoRadius filter in Meilisearch request filter, got %q", rangeReq.Filter)
+		}
+
+		var resp struct {
+			Results []struct {
+				ID                int    `json:"id"`
+				Type              string `json:"type"`
+				FullAddressNumber string `json:"full_address_number"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if len(resp.Results) != 1 || resp.Results[0].ID != 3000000 || resp.Results[0].FullAddressNumber != "1/100A-120A" {
+			t.Errorf("expected ranged address 3000000 (1/100A-120A), got %+v", resp.Results)
+		}
+	})
+
+	t.Run("un-united street number returns both exact and ranged with exact ranked first", func(t *testing.T) {
+		*bodies = nil
+		req := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=110+Queen+St", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var resp struct {
+			Results []struct {
+				ID                int    `json:"id"`
+				FullAddressNumber string `json:"full_address_number"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if len(resp.Results) != 2 || resp.Results[0].ID != 3000001 || resp.Results[1].ID != 3000000 {
+			t.Errorf("expected exact address 3000001 followed by ranged 3000000, got %+v", resp.Results)
+		}
+	})
+
+	t.Run("street number with suffix filters by suffix", func(t *testing.T) {
+		*bodies = nil
+		req := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=15B+Ponsonby+Rd", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var resp struct {
+			Results []struct {
+				ID                int    `json:"id"`
+				FullAddressNumber string `json:"full_address_number"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if len(resp.Results) != 1 || resp.Results[0].ID != 3000002 {
+			t.Errorf("expected suffixed address 3000002 (15B), got %+v", resp.Results)
+		}
+	})
+
+	t.Run("exact house number prioritized before limit=1 even when range fixture is indexed first", func(t *testing.T) {
+		*bodies = nil
+		req := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=110+Queen+St&limit=1", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var resp struct {
+			Results []struct {
+				ID                int    `json:"id"`
+				FullAddressNumber string `json:"full_address_number"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if len(resp.Results) != 1 || resp.Results[0].ID != 3000001 {
+			t.Errorf("expected exact address 3000001 for limit=1, got %+v", resp.Results)
+		}
+	})
+
+	t.Run("standalone house number equal to range lower bound is prioritized over range with limit=1", func(t *testing.T) {
+		*bodies = nil
+		req := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=100A+Queen+St&limit=1", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var resp struct {
+			Results []struct {
+				ID                int    `json:"id"`
+				FullAddressNumber string `json:"full_address_number"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if len(resp.Results) != 1 || resp.Results[0].ID != 3000005 {
+			t.Errorf("expected standalone address 3000005 (100A) ahead of range 3000000 (1/100A-120A), got %+v", resp.Results)
+		}
+	})
+
+	t.Run("unfinished street prefix in unit-address query stays last and matches via prefix", func(t *testing.T) {
+		*bodies = nil
+		req := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=1/110+Qu", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var resp struct {
+			Results []struct {
+				ID                int    `json:"id"`
+				FullAddressNumber string `json:"full_address_number"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if len(resp.Results) != 1 || resp.Results[0].ID != 3000000 {
+			t.Errorf("expected prefix-matched ranged unit address 3000000 for '1/110 Qu', got %+v", resp.Results)
+		}
+	})
+
+	t.Run("mismatched road name with matching house number is excluded by MatchingStrategy All", func(t *testing.T) {
+		*bodies = nil
+		req := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=110+Ponsonby+Rd", nil)
+		rec := httptest.NewRecorder()
+		srv.Handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+		}
+
+		var resp struct {
+			Results []struct {
+				ID int `json:"id"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal response: %v", err)
+		}
+		if len(resp.Results) != 0 {
+			t.Errorf("expected 0 results for mismatched road name, got %+v", resp.Results)
+		}
+	})
+}
+
+func TestAutosuggestWithRoadType(t *testing.T) {
+	srv, bodies := newTestServer(t, 50, 100)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/autosuggest?q=Queen+St", nil)
 	rec := httptest.NewRecorder()
 	srv.Handler.ServeHTTP(rec, req)
 
@@ -189,34 +581,24 @@ func TestAutosuggestWithStreetNumber(t *testing.T) {
 	}
 
 	if len(*bodies) == 0 {
-		t.Fatal("expected Meilisearch search request body")
+		t.Fatal("expected Meilisearch street search request body")
 	}
-	var searchReq struct {
-		Filter string `json:"filter"`
-		Q      string `json:"q"`
-	}
-	if err := json.Unmarshal([]byte((*bodies)[0]), &searchReq); err != nil {
-		t.Fatalf("unmarshal search request: %v", err)
-	}
-	if !strings.Contains(searchReq.Filter, "address_number <= 110 AND address_number_high >= 110") {
-		t.Errorf("expected range filter in Meilisearch request filter, got %q", searchReq.Filter)
-	}
-	if !strings.Contains(searchReq.Filter, "_geoRadius(-36.848500, 174.763300, 50000)") {
-		t.Errorf("expected _geoRadius filter in Meilisearch request filter, got %q", searchReq.Filter)
+	if strings.Contains((*bodies)[0], `"queries"`) {
+		t.Errorf("expected single street index search rather than multi-search for road-type query, got %s", (*bodies)[0])
 	}
 
 	var resp struct {
 		Results []struct {
-			ID                int    `json:"id"`
-			Type              string `json:"type"`
-			FullAddressNumber string `json:"full_address_number"`
+			ID          int    `json:"id"`
+			Type        string `json:"type"`
+			FullAddress string `json:"full_address"`
 		} `json:"results"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
-	if len(resp.Results) != 1 || resp.Results[0].ID != 3000000 || resp.Results[0].Type != "address" {
-		t.Errorf("unexpected results: %+v", resp.Results)
+	if len(resp.Results) != 1 || resp.Results[0].Type != "street" || resp.Results[0].ID != 1000000 {
+		t.Errorf("expected only street results for 'Queen St', got %+v", resp.Results)
 	}
 }
 
@@ -240,10 +622,10 @@ func TestAutosuggestWithoutStreetNumberMultiSearch(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal response: %v", err)
 	}
-	if len(resp.Results) != 3 {
-		t.Fatalf("expected 3 merged results (locality, street, address), got %d", len(resp.Results))
+	if len(resp.Results) != 2 {
+		t.Fatalf("expected 2 merged results (locality and street, no random house addresses), got %d", len(resp.Results))
 	}
-	if resp.Results[0].Type != "locality" || resp.Results[1].Type != "street" || resp.Results[2].Type != "address" {
+	if resp.Results[0].Type != "locality" || resp.Results[1].Type != "street" {
 		t.Errorf("unexpected result types ordering: %+v", resp.Results)
 	}
 }

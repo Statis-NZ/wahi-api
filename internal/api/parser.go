@@ -18,10 +18,71 @@ var addressQueryRegex = regexp.MustCompile(
 	`(?i)^(?:(?:unit|flat|apt|u|f)\s*([a-zA-Z0-9]+)[,\s/]+|([a-zA-Z0-9]+)\s*/\s*)?(\d+)([a-zA-Z])?(?:\s*-\s*(\d+)([a-zA-Z])?)?\b[,\s]*(.*)$`,
 )
 
+var roadTypeTokens = map[string]struct{}{
+	"st": {}, "street": {},
+	"rd": {}, "road": {},
+	"ave": {}, "av": {}, "avenue": {},
+	"dr": {}, "drive": {},
+	"pl": {}, "place": {},
+	"cres": {}, "cr": {}, "crescent": {},
+	"tce": {}, "ter": {}, "terrace": {},
+	"hwy": {}, "highway": {},
+	"ln": {}, "lane": {},
+	"ct": {}, "crt": {}, "court": {},
+	"way":  {},
+	"quay": {}, "qy": {},
+	"grv": {}, "grove": {},
+	"cl": {}, "close": {},
+	"blvd": {}, "bvd": {}, "boulevard": {},
+	"esp": {}, "esplanade": {},
+	"pde": {}, "parade": {},
+	"mews": {},
+	"rise": {},
+	"wk":   {}, "walk": {},
+	"trk": {}, "track": {},
+	"cct": {}, "circuit": {},
+	"loop": {},
+	"sq":   {}, "square": {},
+	"mall": {},
+	"al":   {}, "alley": {},
+	"fwy": {}, "freeway": {},
+	"mwy": {}, "motorway": {},
+	"pkwy": {}, "parkway": {},
+	"cswy": {}, "causeway": {},
+	"brae": {},
+}
+
+// hasRoadTypeToken checks whether a query contains an unambiguous road type suffix
+// (e.g. "Queen St", "Ponsonby Road", "St Lukes Rd") or highway prefix ("SH 1", "State Highway 45").
+// Leading "St" (e.g. "St Heliers") at token index 0 is treated as "Saint", not a road type.
+func hasRoadTypeToken(s string) bool {
+	tokens := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return r == ' ' || r == '\t' || r == ',' || r == '.'
+	})
+	if len(tokens) < 2 {
+		return false
+	}
+	for i, tok := range tokens {
+		if i == 0 {
+			if tok == "st" {
+				continue
+			}
+			if tok == "sh" {
+				return true
+			}
+		}
+		if _, ok := roadTypeTokens[tok]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // ParsedQuery holds the structured components extracted from an address search query.
 type ParsedQuery struct {
 	Raw             string
 	HasStreetNumber bool
+	HasRoadType     bool
 	Unit            string
 	Number          int
 	NumberSuffix    string
@@ -30,8 +91,8 @@ type ParsedQuery struct {
 	StreetQuery     string
 }
 
-// ParseAddressQuery extracts NZ unit numbers, street numbers, suffixes, and ranges
-// from a raw search string.
+// ParseAddressQuery extracts NZ unit numbers, street numbers, suffixes, ranges,
+// and road type indicators from a raw search string.
 func ParseAddressQuery(q string) ParsedQuery {
 	trimmed := strings.TrimSpace(q)
 	if trimmed == "" {
@@ -43,6 +104,7 @@ func ParseAddressQuery(q string) ParsedQuery {
 		return ParsedQuery{
 			Raw:             trimmed,
 			HasStreetNumber: false,
+			HasRoadType:     hasRoadTypeToken(trimmed),
 			StreetQuery:     trimmed,
 		}
 	}
@@ -58,6 +120,7 @@ func ParseAddressQuery(q string) ParsedQuery {
 		return ParsedQuery{
 			Raw:             trimmed,
 			HasStreetNumber: false,
+			HasRoadType:     hasRoadTypeToken(trimmed),
 			StreetQuery:     trimmed,
 		}
 	}
@@ -76,6 +139,7 @@ func ParseAddressQuery(q string) ParsedQuery {
 	return ParsedQuery{
 		Raw:             trimmed,
 		HasStreetNumber: true,
+		HasRoadType:     hasRoadTypeToken(remaining),
 		Unit:            unit,
 		Number:          num,
 		NumberSuffix:    suffix,
@@ -91,8 +155,35 @@ func (p ParsedQuery) BuildAddressNumberFilter() string {
 	if !p.HasStreetNumber {
 		return ""
 	}
+	if p.NumberHigh != nil {
+		return p.BuildRangeAddressNumberFilter()
+	}
 	return fmt.Sprintf(
-		"(address_number = %d OR (address_number <= %d AND address_number_high >= %d))",
-		p.Number, p.Number, p.Number,
+		"(address_number = %d OR %s)",
+		p.Number,
+		p.BuildRangeAddressNumberFilter(),
 	)
+}
+
+// BuildExactAddressNumberFilter returns the Meilisearch filter expression for an exact
+// standalone (non-ranged) street number match, excluding ranged documents whose lower
+// bound equals the queried number.
+func (p ParsedQuery) BuildExactAddressNumberFilter() string {
+	if !p.HasStreetNumber {
+		return ""
+	}
+	return fmt.Sprintf("(address_number = %d AND (address_number_high NOT EXISTS OR address_number_high IS NULL))", p.Number)
+}
+
+// BuildRangeAddressNumberFilter returns the Meilisearch filter expression for ranged addresses
+// covering the queried street number or range.
+func (p ParsedQuery) BuildRangeAddressNumberFilter() string {
+	if !p.HasStreetNumber {
+		return ""
+	}
+	high := p.Number
+	if p.NumberHigh != nil {
+		high = *p.NumberHigh
+	}
+	return fmt.Sprintf("(address_number <= %d AND address_number_high >= %d)", p.Number, high)
 }
