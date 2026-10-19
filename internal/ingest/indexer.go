@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"runtime"
 	"runtime/debug"
 	"time"
@@ -21,30 +23,47 @@ const (
 	IndexLocalities = "localities"
 )
 
-// DefaultSynonyms returns the NZ road and locality synonyms dictionary from SPEC.md Section 4.1.
+// DefaultSynonyms returns the NZ road abbreviation synonyms dictionary.
+// Abbreviations expand one-way to full words (e.g. "st" -> "street") because LINZ
+// full_road_name always spells out the road type while road_name_label stores the abbreviation.
+// Avoiding reverse full-word -> 2-letter abbreviation expansion prevents Meilisearch from
+// treating "street" as a 2-letter prefix wildcard ("st*").
 func DefaultSynonyms() map[string][]string {
 	return map[string][]string{
-		"st":       {"street"},
-		"street":   {"st"},
-		"rd":       {"road"},
-		"road":     {"rd"},
-		"ave":      {"avenue"},
-		"avenue":   {"ave"},
-		"dr":       {"drive"},
-		"drive":    {"dr"},
-		"pl":       {"place"},
-		"place":    {"pl"},
-		"cres":     {"crescent"},
-		"crescent": {"cres"},
-		"tce":      {"terrace"},
-		"terrace":  {"tce"},
-		"hwy":      {"highway"},
-		"sh":       {"state highway"},
-		"ln":       {"lane"},
-		"ct":       {"court"},
-		"mt":       {"mount"},
-		"pt":       {"point"},
-		"cbd":      {"central"},
+		"st":   {"street"},
+		"rd":   {"road"},
+		"ave":  {"avenue"},
+		"av":   {"avenue"},
+		"dr":   {"drive"},
+		"pl":   {"place"},
+		"cres": {"crescent"},
+		"cr":   {"crescent"},
+		"tce":  {"terrace"},
+		"ter":  {"terrace"},
+		"hwy":  {"highway"},
+		"sh":   {"state highway"},
+		"ln":   {"lane"},
+		"ct":   {"court"},
+		"crt":  {"court"},
+		"qy":   {"quay"},
+		"esp":  {"esplanade"},
+		"pde":  {"parade"},
+		"blvd": {"boulevard"},
+		"cl":   {"close"},
+		"grv":  {"grove"},
+	}
+}
+
+// LocalitySynonyms returns synonyms specific to NZ suburbs and localities (without road-type suffixes).
+func LocalitySynonyms() map[string][]string {
+	return map[string][]string{
+		"mt":    {"mount"},
+		"mount": {"mt"},
+		"pt":    {"point"},
+		"point": {"pt"},
+		"st":    {"saint"},
+		"saint": {"st"},
+		"cbd":   {"central"},
 	}
 }
 
@@ -77,6 +96,7 @@ func AddressesIndexSettings() *meilisearch.Settings {
 		FilterableAttributes: []string{
 			"address_number",
 			"address_number_high",
+			"address_number_suffix",
 			"unit",
 			"suburb_locality",
 			"town_city",
@@ -142,7 +162,7 @@ func LocalitiesIndexSettings() *meilisearch.Settings {
 			"_geo",
 		},
 		RankingRules: DefaultRankingRules(),
-		Synonyms:     DefaultSynonyms(),
+		Synonyms:     LocalitySynonyms(),
 	}
 }
 
@@ -176,10 +196,12 @@ func (idx *Indexer) ConfigureIndexes(ctx context.Context) error {
 	}
 
 	for _, c := range configs {
-		_, _ = idx.Client.CreateIndexWithContext(ctx, &meilisearch.IndexConfig{
+		if createTask, err := idx.Client.CreateIndexWithContext(ctx, &meilisearch.IndexConfig{
 			Uid:        c.uid,
 			PrimaryKey: c.primaryKey,
-		})
+		}); err == nil && createTask != nil {
+			_, _ = idx.Client.WaitForTaskWithContext(ctx, createTask.TaskUID, 200*time.Millisecond)
+		}
 		index := idx.Client.Index(c.uid)
 		task, err := index.UpdateSettingsWithContext(ctx, c.settings)
 		if err != nil {
@@ -191,6 +213,62 @@ func (idx *Indexer) ConfigureIndexes(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// ConfigureIndexesWithRetry repeatedly attempts to configure Meilisearch indexes using
+// exponential backoff capped at maxBackoff until it succeeds or ctx is cancelled.
+func (idx *Indexer) ConfigureIndexesWithRetry(ctx context.Context, initialBackoff, maxBackoff time.Duration) error {
+	if initialBackoff <= 0 {
+		initialBackoff = time.Second
+	}
+	if maxBackoff < initialBackoff {
+		maxBackoff = 30 * time.Second
+	}
+	backoff := initialBackoff
+
+	for attempt := 1; ; attempt++ {
+		err := idx.ConfigureIndexes(ctx)
+		if err == nil {
+			if attempt > 1 {
+				slog.Info("synchronized Meilisearch index settings after retry", "attempt", attempt)
+			}
+			return nil
+		}
+		if isPermanentMeiliError(err) {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		slog.Warn("failed to synchronize Meilisearch index settings; retrying",
+			"attempt", attempt,
+			"retry_in", backoff,
+			"error", err,
+		)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
+func isPermanentMeiliError(err error) bool {
+	var meiliErr *meilisearch.Error
+	if errors.As(err, &meiliErr) {
+		return meiliErr.StatusCode >= http.StatusBadRequest &&
+			meiliErr.StatusCode < http.StatusInternalServerError &&
+			meiliErr.StatusCode != http.StatusNotFound &&
+			meiliErr.StatusCode != http.StatusRequestTimeout &&
+			meiliErr.StatusCode != http.StatusTooManyRequests
+	}
+	return false
 }
 
 // IndexLocalities batch-inserts LocalityDocuments into the "localities" index using NDJSON.
