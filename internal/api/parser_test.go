@@ -13,6 +13,7 @@ func TestParseAddressQuery(t *testing.T) {
 		name            string
 		query           string
 		wantHasNumber   bool
+		wantHasRoadType bool
 		wantUnit        string
 		wantNumber      int
 		wantSuffix      string
@@ -24,6 +25,7 @@ func TestParseAddressQuery(t *testing.T) {
 			name:            "simple street number and road",
 			query:           "110 Queen St",
 			wantHasNumber:   true,
+			wantHasRoadType: true,
 			wantNumber:      110,
 			wantStreetQuery: "Queen St",
 			wantFilter:      "(address_number = 110 OR (address_number <= 110 AND address_number_high >= 110))",
@@ -32,6 +34,7 @@ func TestParseAddressQuery(t *testing.T) {
 			name:            "slash unit and street number with suffix",
 			query:           "2/100A Queen St",
 			wantHasNumber:   true,
+			wantHasRoadType: true,
 			wantUnit:        "2",
 			wantNumber:      100,
 			wantSuffix:      "A",
@@ -42,17 +45,19 @@ func TestParseAddressQuery(t *testing.T) {
 			name:            "unit, range, and suffixes",
 			query:           "1/100A-120A, Queen Street West, Auckland Central",
 			wantHasNumber:   true,
+			wantHasRoadType: true,
 			wantUnit:        "1",
 			wantNumber:      100,
 			wantSuffix:      "A",
 			wantNumberHigh:  intPtr(120),
 			wantStreetQuery: "Queen Street West, Auckland Central",
-			wantFilter:      "(address_number = 100 OR (address_number <= 100 AND address_number_high >= 100))",
+			wantFilter:      "(address_number <= 100 AND address_number_high >= 120)",
 		},
 		{
 			name:            "word unit prefix with comma",
 			query:           "Unit 4b, 250 Lambton Quay",
 			wantHasNumber:   true,
+			wantHasRoadType: true,
 			wantUnit:        "4B",
 			wantNumber:      250,
 			wantStreetQuery: "Lambton Quay",
@@ -62,6 +67,7 @@ func TestParseAddressQuery(t *testing.T) {
 			name:            "flat prefix with space",
 			query:           "Flat 2 15B Ponsonby Rd",
 			wantHasNumber:   true,
+			wantHasRoadType: true,
 			wantUnit:        "2",
 			wantNumber:      15,
 			wantSuffix:      "B",
@@ -72,6 +78,7 @@ func TestParseAddressQuery(t *testing.T) {
 			name:            "apt prefix with slash",
 			query:           "Apt 12/88 Broadway, Newmarket",
 			wantHasNumber:   true,
+			wantHasRoadType: false,
 			wantUnit:        "12",
 			wantNumber:      88,
 			wantStreetQuery: "Broadway, Newmarket",
@@ -81,6 +88,7 @@ func TestParseAddressQuery(t *testing.T) {
 			name:            "number only query",
 			query:           "100",
 			wantHasNumber:   true,
+			wantHasRoadType: false,
 			wantNumber:      100,
 			wantStreetQuery: "",
 			wantFilter:      "(address_number = 100 OR (address_number <= 100 AND address_number_high >= 100))",
@@ -89,13 +97,39 @@ func TestParseAddressQuery(t *testing.T) {
 			name:            "street only query without number",
 			query:           "Ponsonby Rd",
 			wantHasNumber:   false,
+			wantHasRoadType: true,
 			wantStreetQuery: "Ponsonby Rd",
+			wantFilter:      "",
+		},
+		{
+			name:            "queen st query without number",
+			query:           "queen st",
+			wantHasNumber:   false,
+			wantHasRoadType: true,
+			wantStreetQuery: "queen st",
+			wantFilter:      "",
+		},
+		{
+			name:            "saint suburb prefix is not treated as road type",
+			query:           "St Heliers",
+			wantHasNumber:   false,
+			wantHasRoadType: false,
+			wantStreetQuery: "St Heliers",
+			wantFilter:      "",
+		},
+		{
+			name:            "saint road name with road type suffix",
+			query:           "St Heliers Bay Rd",
+			wantHasNumber:   false,
+			wantHasRoadType: true,
+			wantStreetQuery: "St Heliers Bay Rd",
 			wantFilter:      "",
 		},
 		{
 			name:            "suburb with macron",
 			query:           "Ōtara",
 			wantHasNumber:   false,
+			wantHasRoadType: false,
 			wantStreetQuery: "Ōtara",
 			wantFilter:      "",
 		},
@@ -103,6 +137,7 @@ func TestParseAddressQuery(t *testing.T) {
 			name:            "state highway without leading street number",
 			query:           "State Highway 45",
 			wantHasNumber:   false,
+			wantHasRoadType: true,
 			wantStreetQuery: "State Highway 45",
 			wantFilter:      "",
 		},
@@ -110,6 +145,7 @@ func TestParseAddressQuery(t *testing.T) {
 			name:            "empty query",
 			query:           "   ",
 			wantHasNumber:   false,
+			wantHasRoadType: false,
 			wantStreetQuery: "",
 			wantFilter:      "",
 		},
@@ -120,6 +156,9 @@ func TestParseAddressQuery(t *testing.T) {
 			got := ParseAddressQuery(tc.query)
 			if got.HasStreetNumber != tc.wantHasNumber {
 				t.Fatalf("HasStreetNumber = %v, want %v", got.HasStreetNumber, tc.wantHasNumber)
+			}
+			if got.HasRoadType != tc.wantHasRoadType {
+				t.Errorf("HasRoadType = %v, want %v", got.HasRoadType, tc.wantHasRoadType)
 			}
 			if got.Unit != tc.wantUnit {
 				t.Errorf("Unit = %q, want %q", got.Unit, tc.wantUnit)

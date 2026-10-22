@@ -70,6 +70,11 @@ func runServe(cfg *config.Config, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	indexer := ingest.NewIndexer(meiliClient, cfg.BatchSize)
+	if err := indexer.ConfigureIndexesWithRetry(ctx, time.Second, 30*time.Second); err != nil {
+		return fmt.Errorf("synchronize Meilisearch index settings: %w", err)
+	}
+
 	sighupCh := make(chan os.Signal, 1)
 	signal.Notify(sighupCh, syscall.SIGHUP)
 	defer signal.Stop(sighupCh)
