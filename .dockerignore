@@ -1,0 +1,19 @@
+# Exclude local demo/example page from container build context
+demo/
+
+# Git and CI
+.git/
+.github/
+.gitignore
+
+# Local environment and data
+.env
+*.local
+data/
+docs/
+
+# Documentation and IDE files
+*.md
+.DS_Store
+.idea/
+.vscode/
