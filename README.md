@@ -40,9 +40,14 @@ wahi-api/
 │   └── models/
 │       └── types.go             # Source LINZ structs & target Meilisearch document structs
 ├── testdata/                    # Sample fixture CSVs (suburbs, roads, addresses)
+├── demo/
+│   ├── index.html               # Standalone local demo & playground page (excluded from Docker image)
+│   ├── styles.css               # Demo page styles
+│   └── app.js                   # Demo page client-side logic
 ├── deploy/
 │   ├── Dockerfile               # Multi-stage Go build (distroless runtime)
 │   └── docker-compose.yml       # Go API + memory-constrained Meilisearch service
+├── .dockerignore
 ├── .env.example
 ├── go.mod
 └── README.md
@@ -109,7 +114,7 @@ wahi-api/
    go run ./cmd/server serve --port 8080
    ```
 
-4. Open `http://localhost:8080/docs` for the interactive OpenAPI 3.1 explorer.
+4. Open `http://localhost:8080/docs` for the interactive OpenAPI 3.1 explorer, or open `demo/index.html` in your browser (or via `python3 -m http.server 3000 -d demo`) to test autosuggest, address lookup, and map-based reverse geocoding locally.
 
 ---
 
