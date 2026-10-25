@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en-NZ">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Wāhi API — Local Demo &amp; Playground</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
+    crossorigin=""
+  >
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="brand">
+        <h1>Wāhi API — Local Playground</h1>
+        <div class="brand-subtitle">New Zealand Address Autosuggest, Lookup &amp; Reverse Geocoding Demo</div>
+      </div>
+      <div class="health-bar">
+        <span id="health-badge" class="badge">
+          <span class="dot"></span>
+          <span id="health-text">Checking API…</span>
+        </span>
+        <span id="index-counts" class="badge" title="Meilisearch document counts">
+          Addresses: – | Streets: – | Localities: –
+        </span>
+        <a id="openapi-link" href="http://localhost:8080/docs" target="_blank" rel="noopener" class="badge">
+          OpenAPI Docs ↗
+        </a>
+      </div>
+    </header>
+
+    <!-- API Connection & Authentication Settings -->
+    <section class="card" aria-label="API Connection Settings">
+      <form id="connection-form" class="config-grid">
+        <div class="field">
+          <label for="api-base-url">API Base URL</label>
+          <input
+            type="url"
+            id="api-base-url"
+            name="api_base_url"
+            value="http://localhost:8080"
+            placeholder="http://localhost:8080"
+            autocomplete="url"
+            required
+          >
+        </div>
+        <div class="field">
+          <label for="api-token">Access Token (optional)</label>
+          <input
+            type="password"
+            id="api-token"
+            name="api_token"
+            placeholder="Leave empty if API_ACCESS_TOKENS is unset"
+            autocomplete="off"
+          >
+        </div>
+        <div class="field">
+          <label for="auth-mode">Token Delivery Method</label>
+          <select id="auth-mode" name="auth_mode">
+            <option value="bearer">Authorization: Bearer &lt;token&gt;</option>
+            <option value="header">X-API-Key: &lt;token&gt;</option>
+            <option value="query">?api_key=&lt;token&gt;</option>
+          </select>
+        </div>
+        <div class="field">
+          <button type="submit">Check Connection</button>
+        </div>
+      </form>
+    </section>
+
+    <div class="main-grid">
+      <!-- Left Column: Autosuggest + Selected Address Form + Reverse Geocoding -->
+      <div>
+        <!-- 1. Autosuggest Playground -->
+        <section class="card" aria-labelledby="autosuggest-heading">
+          <div class="card-header">
+            <div class="card-title-group">
+              <h2 class="card-title" id="autosuggest-heading">1. Autosuggest</h2>
+              <span class="endpoint-pill">GET /v1/autosuggest</span>
+            </div>
+            <span id="autosuggest-timing" class="badge">– ms</span>
+          </div>
+
+          <div class="search-wrapper">
+            <label for="autosuggest-q" style="display:block; margin-bottom:0.35rem;">
+              Search NZ Address, Road, or Suburb
+            </label>
+            <div class="search-input-row">
+              <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="11" cy="11" r="8"></circle>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+              </svg>
+              <input
+                type="search"
+                id="autosuggest-q"
+                name="q"
+                placeholder="Search e.g. '1/110 Queen St', '15B Ponsonby Rd', 'Ōtara'…"
+                autocomplete="off"
+                role="combobox"
+                aria-expanded="false"
+                aria-controls="suggestions-list"
+                aria-autocomplete="list"
+              >
+              <div class="search-meta">
+                <button type="button" id="clear-search-btn" class="secondary sm">
+                  Clear
+                </button>
+              </div>
+            </div>
+
+            <ul id="suggestions-list" class="suggestions-list" role="listbox" hidden></ul>
+          </div>
+
+          <!-- Sample Queries -->
+          <div class="chips-row">
+            <span class="chips-label">Try query:</span>
+            <button type="button" class="chip" data-sample-q="1/110 Queen St">1/110 Queen St</button>
+            <button type="button" class="chip" data-sample-q="2/110 Queen St">2/110 Queen St</button>
+            <button type="button" class="chip" data-sample-q="15B Ponsonby Rd">15B Ponsonby Rd</button>
+            <button type="button" class="chip" data-sample-q="42 Main South Rd">42 Main South Rd</button>
+            <button type="button" class="chip" data-sample-q="Surf Highway">Surf Highway</button>
+            <button type="button" class="chip" data-sample-q="Otara">Otara → Ōtara</button>
+            <button type="button" class="chip" data-sample-q="1 Lambton Quay" data-sample-proposed="true">1 Lambton Quay</button>
+          </div>
+
+          <!-- Autosuggest Query Parameters -->
+          <div class="autosuggest-params-grid">
+            <div class="field">
+              <label for="filter-type" title="type">Type (<code>type</code>)</label>
+              <select id="filter-type">
+                <option value="all">all</option>
+                <option value="address">address</option>
+                <option value="street">street</option>
+                <option value="locality">locality</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="filter-town" title="town_city">Town / City</label>
+              <input type="text" id="filter-town" placeholder="e.g. Auckland" autocomplete="address-level2">
+            </div>
+            <div class="field">
+              <label for="filter-limit" title="limit">Limit</label>
+              <input type="number" id="filter-limit" value="10" min="1" max="25">
+            </div>
+            <div class="field">
+              <label for="filter-lat" title="lat">Bias Lat</label>
+              <input type="number" id="filter-lat" step="any" placeholder="-36.8485">
+            </div>
+            <div class="field">
+              <label for="filter-lon" title="lon">Bias Lon</label>
+              <input type="number" id="filter-lon" step="any" placeholder="174.7633">
+            </div>
+          </div>
+
+          <div class="chips-row" style="margin-top: 0.75rem; margin-bottom: 0; justify-content: space-between;">
+            <label class="checkbox-label" for="filter-proposed">
+              <input type="checkbox" id="filter-proposed">
+              <span>Include Proposed (<code>include_proposed=true</code>)</span>
+            </label>
+            <div style="display:flex; flex-wrap:wrap; gap:0.35rem; align-items:center;">
+              <span class="chips-label">Geo-bias:</span>
+              <button type="button" class="chip" data-bias-lat="-36.8485" data-bias-lon="174.7633">Auckland</button>
+              <button type="button" class="chip" data-bias-lat="-41.2790" data-bias-lon="174.7762">Wellington</button>
+              <button type="button" class="chip" data-bias-lat="-39.1170" data-bias-lon="173.9550">Oakura</button>
+              <button type="button" class="chip" id="clear-bias-btn">Clear</button>
+            </div>
+          </div>
+        </section>
+
+        <!-- 2. Address Form & Decomposed Address Lookup -->
+        <section class="card" aria-labelledby="address-detail-heading">
+          <div class="card-header">
+            <div class="card-title-group">
+              <h2 class="card-title" id="address-detail-heading">2. Address Lookup &amp; Autofill Form</h2>
+              <span class="endpoint-pill">GET /v1/addresses/{address_id}</span>
+            </div>
+          </div>
+
+          <form id="address-id-form" class="address-lookup-row">
+            <div class="field">
+              <label for="lookup-address-id">LINZ <code>address_id</code></label>
+              <input type="number" id="lookup-address-id" min="1" value="2080017" required>
+            </div>
+            <button type="submit">Fetch Address by ID</button>
+          </form>
+
+          <div class="chips-row">
+            <span class="chips-label">Sample IDs:</span>
+            <button type="button" class="chip" data-address-id="2080017">#2080017</button>
+            <button type="button" class="chip" data-address-id="3000000">#3000000 (Fixture)</button>
+            <button type="button" class="chip" data-address-id="3000001">#3000001 (Fixture)</button>
+            <button type="button" class="chip" data-address-id="3000002">#3000002 (Fixture)</button>
+          </div>
+
+          <!-- Semantic Address Form following modern web autofill best practices -->
+          <form id="populated-address-form" class="form-grid" onsubmit="event.preventDefault();">
+            <div class="field full-width">
+              <label for="form-street-address">Street Address</label>
+              <textarea
+                id="form-street-address"
+                name="address"
+                autocomplete="street-address"
+                placeholder="Select a suggestion above or fetch by ID to populate…"
+                required
+              ></textarea>
+            </div>
+            <div class="field">
+              <label for="form-suburb">Suburb / Locality</label>
+              <input
+                type="text"
+                id="form-suburb"
+                name="suburb"
+                autocomplete="address-level3"
+                placeholder="Suburb or locality"
+              >
+            </div>
+            <div class="field">
+              <label for="form-city">Town / City</label>
+              <input
+                type="text"
+                id="form-city"
+                name="city"
+                autocomplete="address-level2"
+                placeholder="Town or city"
+                required
+              >
+            </div>
+            <div class="field">
+              <label for="form-ta">Territorial Authority</label>
+              <input
+                type="text"
+                id="form-ta"
+                name="territorial_authority"
+                autocomplete="address-level1"
+                placeholder="Territorial authority"
+              >
+            </div>
+            <div class="field">
+              <label for="form-coords">Coordinates (WGS84 / NZGD2000)</label>
+              <input
+                type="text"
+                id="form-coords"
+                name="coordinates"
+                readonly
+                placeholder="lat, lon"
+              >
+            </div>
+          </form>
+
+          <div id="decomposed-fields" class="kv-grid" hidden></div>
+        </section>
+
+        <!-- 3. Reverse Geocoding Playground -->
+        <section class="card" aria-labelledby="reverse-heading">
+          <div class="card-header">
+            <div class="card-title-group">
+              <h2 class="card-title" id="reverse-heading">3. Reverse Geocode Coordinates</h2>
+              <span class="endpoint-pill">GET /v1/reverse</span>
+            </div>
+          </div>
+
+          <form id="reverse-form" class="reverse-params-grid">
+            <div class="field">
+              <label for="rev-lat">Latitude (<code>lat</code>)</label>
+              <input type="number" id="rev-lat" step="any" value="-36.8485" min="-90" max="90" required>
+            </div>
+            <div class="field">
+              <label for="rev-lon">Longitude (<code>lon</code>)</label>
+              <input type="number" id="rev-lon" step="any" value="174.7633" min="-180" max="180" required>
+            </div>
+            <div class="field">
+              <label for="rev-radius">Radius (<code>radius_m</code>)</label>
+              <input type="number" id="rev-radius" value="250" min="1" max="1000" required>
+            </div>
+            <div class="field">
+              <label for="rev-limit">Limit</label>
+              <input type="number" id="rev-limit" value="5" min="1" max="25" required>
+            </div>
+            <div class="field">
+              <button type="submit">Find Nearest</button>
+            </div>
+          </form>
+
+          <div class="chips-row" style="margin-bottom:0;">
+            <span class="chips-label">Preset coords:</span>
+            <button type="button" class="chip" data-rev-lat="-36.8485" data-rev-lon="174.7633">Auckland CBD (-36.8485, 174.7633)</button>
+            <button type="button" class="chip" data-rev-lat="-36.8520" data-rev-lon="174.7460">Ponsonby (-36.8520, 174.7460)</button>
+            <button type="button" class="chip" data-rev-lat="-41.2790" data-rev-lon="174.7762">Wellington (-41.2790, 174.7762)</button>
+          </div>
+        </section>
+      </div>
+
+      <!-- Right Column: Interactive Map + Request/Response Inspector -->
+      <div>
+        <!-- Interactive Map -->
+        <section class="card" aria-labelledby="map-heading">
+          <div class="card-header">
+            <h2 class="card-title" id="map-heading">Interactive Map (Click to Reverse Geocode)</h2>
+          </div>
+          <div id="map"></div>
+          <div class="map-hint">
+            <span>Click map to run <code>GET /v1/reverse</code></span>
+            <span id="map-coords-readout">-36.8485, 174.7633</span>
+          </div>
+        </section>
+
+        <!-- Request & Response Inspector -->
+        <section class="card" aria-labelledby="inspector-heading">
+          <div class="card-header">
+            <h2 class="card-title" id="inspector-heading">Request &amp; Response Inspector</h2>
+            <div style="display:flex; gap:0.4rem; align-items:center;">
+              <span id="inspector-status" class="badge">Ready</span>
+              <button type="button" id="copy-curl-btn" class="secondary sm">
+                Copy cURL
+              </button>
+            </div>
+          </div>
+
+          <div class="inspector-bar">
+            <span id="inspector-url" class="inspector-url">GET http://localhost:8080/healthz</span>
+          </div>
+
+          <pre><code id="inspector-json">// API response payload will appear here</code></pre>
+        </section>
+      </div>
+    </div>
+  </div>
+
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
+    crossorigin=""
+  ></script>
+  <script src="app.js" defer></script>
+</body>
+</html>
